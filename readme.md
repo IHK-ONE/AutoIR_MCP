@@ -1,6 +1,6 @@
 ```plain
 [!] 项目停止更新
-切勿直接用于生产环境，该项目已经集成应急响应的 MCP 功能，提示词并未优化完善。
+切勿直接用于生产环境，该项目已经集成应急响应的 MCP 功能，提示词并未优化完善。可以根据个人需求更改。
 ```
 
 AutoIR 的 FastMCP 版本，可以使用 Vscode / cursor 进行 AI 自动化应急响应
@@ -71,7 +71,7 @@ uv pip install -r requirements.txt
 
 ![](https://cdn.nlark.com/yuque/0/2025/png/35229002/1760464295921-21ef314e-a9ca-49cc-b1ff-ee3b7e5798eb.png)
 
-配置完后直接询问即可
+配置完后直接询问即可，尽量使用高参数模型，回答更加精准
 
 ![](https://cdn.nlark.com/yuque/0/2025/png/35229002/1760463837550-179de7da-0429-4a72-9886-8b222a97101f.png)
 
