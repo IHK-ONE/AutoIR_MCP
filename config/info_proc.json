@@ -1,0 +1,10 @@
+{
+  "_comment": "该字典用于排除进程排查时，可能会因为进程名和执行的命令不一样导致的误判。",
+
+  "systemd": "init",
+  "udevadm": "systemd-udevd",
+  "bash": "-bash",
+  "dash": "sh",
+  "busybox": "sh",
+  "node": "next-server"
+}
