@@ -3,5 +3,5 @@
     "Server": "https://check-safeline.ihk-one.top/?input=",
     "_comment": "请务必将 Server 的服务改成 get 接收参数格式，例如 https://check.ihk-one.top?input= ，可以使用本地或远程地址，离线时 Server 可以 SSH 隧道穿透"
   }
-
 }
+
