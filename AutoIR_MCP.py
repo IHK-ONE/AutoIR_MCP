@@ -32,14 +32,14 @@ mcp = FastMCP("AutoIR_MCP", instructions="""
     每个模块可单独调用，也可按顺序全量巡检，巡检要求每个模块内巡检子工具。
     | 模块 | 工具函数 | 功能描述 |
     |------|-----------|-----------|
-    | ijackAnalysis | 检查环境变量劫持 |
-    | UserAnalysis | 用户与授权异常 |
-    | ProcAnalysis | 恶意或隐藏进程 |
-    | NetworkAnalysis | 网络异常与外联行为 |
-    | FileAnalysis | 可疑文件与 WebShell |
-    | BackdoorAnalysis | 后门与持久化机制 |
-    | LogAnalysis | 登录与访问日志分析 |
-    | Rookit | Rootkit 检测 |
+    | 1 | ijackAnalysis | 检查环境变量劫持 |
+    | 2 | UserAnalysis | 用户与授权异常 |
+    | 3 | ProcAnalysis | 恶意或隐藏进程 |
+    | 4 | NetworkAnalysis | 网络异常与外联行为 |
+    | 5 | FileAnalysis | 可疑文件与 WebShell |
+    | 6 | BackdoorAnalysis | 后门与持久化机制 |
+    | 7 | LogAnalysis | 登录与访问日志分析 |
+    | 8 | Rookit | Rootkit 检测 |
 
     ## 调用逻辑（决策树）
     - 用户明确提到 “SSH 连接”、“目标主机” → 调用 `get_ssh_client`
@@ -56,7 +56,7 @@ mcp = FastMCP("AutoIR_MCP", instructions="""
     若用户未指定模块，自行决策，优先对用户提出的内容进行问题分解，调用最可能需要的工具.
     如果存在可疑内容，但没分析出需要的结果时，应当检查是否有工具最有能进行进一步分析，进行多工具调用（禁止重复调用一个工具两次）。
     如果分析出对应问题的结果，则停止调用，给出分析结果，避免冗杂分析。
-    若用户未提出任何需求，仅提供 SSH 连接信息，则按上述顺序全量执行巡检。
+    若用户未提出任何需求，仅提供 SSH 连接信息，则按上述模块顺序全量执行巡检。
 
     ## 输出要求（强制格式）
     检测报告必须使用以下模板格式输出（可根据代码输出结果进行增加删减列表的标题和内容，仅要求是列表）：
