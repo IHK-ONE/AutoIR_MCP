@@ -1,8 +1,8 @@
 ```plain
-该项目已经集成应急响应的相关的 MCP 工具集，提示词并未优化完善，仅提供 AI 生成的参考。具体根据个人需求更改。
+该项目已经集成应急响应的相关的 MCP 工具集，提示词并未优化完善，仅提供 AI 生成的提示词参考。具体根据个人需求更改。
 ```
 
-AutoIR 的 FastMCP 版本，可以使用 Vscode / cursor 进行 AI 自动化应急响应
+AutoIR 的 FastMCP 版本，可以使用 Vscode / cursor 进行 AI 自动化应急响应，并未进行 Debug，如果有问题可以 Issues 或者联系 作者。
 
 环境配置基本与 AutoIR_Remote 配置相同，详细跳转 [https://github.com/IHK-ONE/AutoIR_Remote](https://github.com/IHK-ONE/AutoIR_Remote)
 
