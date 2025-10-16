@@ -4,7 +4,7 @@
 
 AutoIR 的 FastMCP 版本，可以使用 Vscode / cursor 进行 AI 自动化应急响应，并未进行 Debug，如果有问题可以 Issues 或者联系作者。
 
-推荐使用本地雷池，避免响应过慢！
+默认雷池 WAF 地址 https://check-safeline.ihk-one.top/?input=bash%20-i 推荐使用本地雷池，避免响应过慢！
 
 环境配置基本与 AutoIR_Remote 配置相同，详细跳转 [https://github.com/IHK-ONE/AutoIR_Remote](https://github.com/IHK-ONE/AutoIR_Remote)
 
