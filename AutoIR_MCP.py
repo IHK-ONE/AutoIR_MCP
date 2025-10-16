@@ -2169,18 +2169,14 @@ def check_login_success():
     if result['status'] and result['result']:
         for line in result['result'].splitlines():
             line = line.strip()
-            try:
-                parts = re.split(r'\s+', line)
-                if len(parts) >= 3:
-                    user = parts[0]
-                    ip = parts[2]
-                    login_success[user] = ip
-                    if ip in login_success:
-                        login_success[ip] += 1
-                    else:
-                        login_success[ip] = 1
-            except:
-                pass
+            # 匹配 IPv4
+            ip_match = re.search(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', line)
+            if not ip_match:
+                continue
+            ip = ip_match.group()
+            user = line.split()[0]
+            login_success[user] = ip
+            login_success[ip] = login_success.get(ip, 0) + 1
 
     for ip, count in login_success.items():
         if '.' in ip:
@@ -2226,21 +2222,19 @@ def check_login_fail():
     login_fail = {}
 
     result = exec_command(ssh_session.client, 'lastb')
+
     if result['status'] and result['result']:
         for line in result['result'].splitlines():
             line = line.strip()
-            try:
-                parts = re.split(r'\s+', line)
-                if len(parts) >= 3:
-                    user = parts[0]
-                    ip = parts[2]
-                    login_fail[user] = ip
-                    if ip in login_fail:
-                        login_fail[ip] += 1
-                    else:
-                        login_fail[ip] = 1
-            except:
-                pass
+            
+            ip_match = re.search(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', line)
+            if not ip_match:
+                continue
+            ip = ip_match.group()
+            user = line.split()[0]
+            login_fail[user] = ip
+            
+            login_fail[ip] = login_fail.get(ip, 0) + 1
 
     for ip, count in login_fail.items():
         if '.' in ip:
