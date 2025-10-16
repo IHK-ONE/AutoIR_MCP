@@ -74,6 +74,10 @@ uv pip install -r requirements.txt
 
 配置完后直接询问即可，尽量使用高参数模型，回答更加精准
 
+测试1
+
 ![](https://cdn.nlark.com/yuque/0/2025/png/35229002/1760463837550-179de7da-0429-4a72-9886-8b222a97101f.png)
+
+测试2
 
 ![](https://cdn.nlark.com/yuque/0/2025/png/35229002/1760604967548-d636825b-0f10-406f-9ea2-5b3ab86a0050.png)
