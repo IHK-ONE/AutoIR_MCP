@@ -64,8 +64,9 @@
 
 # MCP 导入
 ```plain
-uv init autoir-mcp
-uv pip install -r requirements.txt
+pip install uv
+cd ./AutoIR_MCP
+uv sync
 ```
 
 初始化后，可以直接在 Vscode 与 Cursor 中让 AI 加载 MCP
