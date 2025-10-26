@@ -1,12 +1,10 @@
-```plain
 该项目已经集成应急响应的相关的 MCP 工具接口，仅提供 AI 生成的提示词参考。具体根据个人需求更改 @mcp.tool() 提示词。
-```
 
-AutoIR 的 FastMCP 版本，可以使用 Vscode / cursor 进行 AI 自动化应急响应，并未进行 Debug，如果有问题可以 Issues 或者联系作者。
+该项目为 AutoIR 的 FastMCP 版本，可以使用 Vscode / cursor 进行 AI 自动化应急响应，并未进行 Debug，如果有问题可以 Issues 或者联系作者。
 
-默认雷池 WAF 地址 https://check-safeline.ihk-one.top/?input=bash%20-i 推荐使用本地雷池，避免响应过慢！
+默认已配置完毕，导入 MCP 即可使用，默认雷池 WAF 地址 https://check-safeline.ihk-one.top/?input=bash%20-i 推荐使用本地雷池，以便于离线使用，且避免响应过慢！
 
-环境配置基本与 AutoIR_Remote 配置相同，详细跳转 [https://github.com/IHK-ONE/AutoIR_Remote](https://github.com/IHK-ONE/AutoIR_Remote)
+其余配置基本与 AutoIR_Remote 配置相同，详细跳转 [https://github.com/IHK-ONE/AutoIR_Remote](https://github.com/IHK-ONE/AutoIR_Remote)
 
 # 功能列表
 ```plain
