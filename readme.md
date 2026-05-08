@@ -1,103 +1,166 @@
 # AutoIR_MCP
 
-AutoIR_MCP 是 AutoIR 的 FastMCP 版本，用于通过 VS Code、Cursor 等支持 MCP 的客户端进行 Linux 主机自动化应急响应。项目通过 SSH 连接目标主机，提供用户、进程、网络、文件、后门、日志和 Rootkit 排查工具。
+AutoIR_MCP 是 AutoIR 的 FastMCP 版本，用于通过支持 MCP 的客户端对 Linux 主机执行自动化应急响应。工具通过 SSH 连接目标主机，提供用户、进程、网络、文件、后门、持久化、日志和 Rootkit 排查能力。
 
-> 工具返回结果用于辅助 AI 分析，应急结论仍需结合现场环境人工复核。
+> 工具结果用于辅助分析，最终结论仍需结合现场环境人工复核。
 
-## 功能列表
+## 架构
 
-### 劫持排查
+```plain
+AutoIR_MCP/
+├── AutoIR_MCP.py              # 兼容入口，运行 autoir_mcp.server:mcp
+├── autoir_mcp/
+│   ├── server.py              # FastMCP app、工具注册、编排工具
+│   ├── prompts.py             # MCP instructions、AUTOIR_MCP 艺术字、报告规范
+│   ├── functions.py           # SSH 命令、SFTP、fallback、SafeLine、本地规则
+│   ├── schemas.py             # 结构化结果辅助
+│   ├── session.py             # SSH session 状态模型
+│   ├── transport.py           # 传输层兼容导出
+│   ├── detectors/             # 后续检测模块拆分位置
+│   ├── tools/                 # 后续工具注册拆分位置
+│   └── utils/                 # 路径安全、文本截断等工具
+├── config/                    # SafeLine、/usr/bin、进程基线
+├── extensions/                # HeMa、rkhunter 等本地资产
+└── DumpFileInfo.py            # /usr/bin 基线生成工具
+```
 
-- 检查环境变量是否存在劫持风险
-- 检查常见启动环境中的恶意命令
+## 功能清单
 
-### 用户与权限排查
+### 基础与编排
 
-- 检查 `/home` 下用户目录
-- 检查 `/etc/passwd` 中拥有 shell、root 或特殊权限的用户
-- 检查 `/etc/shadow` 中空口令用户
-- 检查 `/etc/sudoers` 与 `/etc/sudoers.d/*` 中异常 sudo 权限
-- 检查用户 `authorized_keys` 免密登录配置
-- 检查用户历史命令
+- `get_ssh_client`：建立 SSH 会话。
+- `check_ssh_session`：检查 SSH 会话是否可用。
+- `close_ssh_client`：关闭当前 SSH 会话。
+- `reset_session`：重置连接和分析缓存。
+- `readonly_shell`：优先推荐的只读远程 shell，拒绝明显写入/破坏命令。
+- `shell`：通过 MCP 在已连接的 SSH 目标主机执行命令，返回退出码、stdout、stderr、耗时和截断状态；不使用本地 Bash。
+- `check_safeline`：检查 SafeLine WAF 检测能力。
+- `get_system_info`：采集 hostname、内核、系统版本、时间和 uptime。
+- `run_quick_triage`：快速巡检用户、进程、网络、持久化和登录日志。
+- `run_full_triage`：全量巡检，支持 WebShell 和 Rootkit 相关步骤。
+- `get_triage_summary`：读取最近一次巡检缓存，避免重复运行重命令。
 
-### 进程排查
+### 用户与权限
 
-- 检查挖矿脚本和高危命令进程
-- 检查异常启动命令和可疑执行路径
-- 检查隐藏 PID
-- 检查命令名被替换的进程
-- 检查 mount 挂载类进程后门
+- `check_home`
+- `check_history`
+- `check_passwd`
+- `check_shadow`
+- `check_sudoers`
+- `check_ssh_keys`
+- `check_auth_log`
 
-### 网络排查
+### 进程
 
-- 分析本机 IP、监听端口和对外连接
-- 检查网卡信息
-- 检查 `/etc/hosts` 中非标准解析记录
+- `get_ps`
+- `check_mine`
+- `check_exec`
+- `check_pid`
+- `check_exe`
+- `check_mount`
+- `check_deleted_exe`
 
-### 文件与 WebShell 排查
+### 网络
 
-- 基于基线检查 `/usr/bin` 文件权限、属主、链接和文件类型
-- 检查 `/tmp` 下可疑文件，并尽量输出权限、属主、大小和时间
-- 打包下载 webroot，调用本地 HeMa 扫描疑似 WebShell
+- `get_localhost`
+- `check_network`
+- `check_eth`
+- `check_hosts`
+- `check_dns_config`
 
-### 后门与持久化排查
+### 文件、取证与 WebShell
 
-- 检查 `LD_PRELOAD`、`LD_AOUT_PRELOAD`、`LD_ELF_PRELOAD`、`LD_LIBRARY_PATH`
-- 检查 `ld.so.preload`
-- 检查 `PROMPT_COMMAND`、alias、cron、启动项和 rc 文件
-- 检查 SSH 软链接后门、SSH Server wrapper、inetd/xinetd 后门
-- 检查 SUID 类后门
+- `stat_file`
+- `hash_file`
+- `download_file`
+- `upload_file`
+- `collect_evidence_bundle`
+- `check_bin`
+- `check_tmp`
+- `check_webshell`
 
-### 日志排查
+### 后门与持久化
 
-- 分析 Apache access log 中的恶意请求、状态码、跳转和 User-Agent
-- 统计成功登录和失败登录来源 IP
+- `check_ld_so_preload`
+- `check_env_preload`
+- `check_alias`
+- `check_cron`
+- `check_user_crontabs`
+- `check_at_jobs`
+- `check_ssh`
+- `check_ssh_wrapper`
+- `check_inetd`
+- `check_xinetd`
+- `check_setuid`
+- `check_startup`
+- `check_profile`
+- `check_rc`
+- `check_fstab`
+- `check_systemd_timers`
+- `check_service_execstart`
 
-### Rootkit 排查
+### 服务与容器
 
-- 上传并执行 rkhunter 进行 Rootkit 检测
+- `list_services`
+- `check_enabled_services`
+- `check_recent_systemd_changes`
+- `check_docker_containers`
+- `check_container_mounts`
+- `check_container_processes`
 
-## 容错与安全优化
+### 日志与 Rootkit
 
-当前版本增加了以下容错和安全机制：
+- `check_log`
+- `check_web_logs_auto`
+- `check_login_success`
+- `check_login_fail`
+- `RookitUpload`
 
-- SSH 命令执行统一返回 `status`、`result`、`stderr`、`exit_status` 和 `error`，失败时保留错误原因。
-- 多个工具增加跨发行版 fallback，例如 `ss` 失败时尝试 `netstat`，`ip` 失败时尝试 `hostname -I`。
-- 登录日志优先使用 `last`/`lastb`，不可用时 fallback 到 `/var/log/auth.log` 和 `/var/log/secure`。
-- 大日志分析默认只读取最近 `max_lines` 行，避免超大日志拖慢响应。
-- WebShell 扫描默认限制文件数量，并对压缩包解压做路径、类型和大小保护。
-- SUID 扫描默认排除 `/proc`、`/sys`、`/dev`、`/run`、`/mnt`、`/media` 等目录。
-- 空结果会明确返回“未发现明显异常”，减少静默失败。
+## 容错与安全
+
+- SSH 命令统一返回状态、stdout/stderr、退出码、耗时、超时和截断标记。
+- 常见检测提供 fallback，例如 `ss → netstat`、`ip → hostname -I`、`last/lastb → auth.log/secure`。
+- SafeLine 不可用时自动降级到本地规则，并要求报告中说明。
+- 大日志默认只分析最近 `max_lines` 行。
+- WebShell 扫描限制文件数量、单文件大小，并阻断 tar 路径穿越和链接逃逸。
+- SFTP 上传/下载返回明确错误。
+- 所有工具必须区分“未发现明显异常”和“检测失败”。
 
 ## 安装与运行
 
 ```bash
-pip install uv
-git clone git@github.com:IHK-ONE/AutoIR_MCP.git
-cd AutoIR_MCP
 uv sync
 uv run python AutoIR_MCP.py
 ```
 
-## 配置
+## MCP 使用流程
 
-### SafeLine WAF
+1. 调用 `get_ssh_client` 连接目标。
+2. 调用 `check_safeline` 和 `get_system_info` 建立上下文。
+3. 需要直接执行目标机只读命令时优先调用 `readonly_shell(command, timeout, max_bytes)`；明确需要通用执行时再调用 `shell(command, timeout, max_bytes)`。
+4. 快速排查使用 `run_quick_triage`。
+5. 全面排查使用 `run_full_triage`。
+6. 需要复用最近巡检结果时调用 `get_triage_summary`。
+7. 专项问题按工具分组调用对应工具。
+8. 工具失败、权限不足、WAF 不可用、输出截断必须写入报告。
 
-编辑 `config/config.json`，配置 SafeLine WAF GET 检测接口：
+## SafeLine 配置
+
+编辑 `config/config.json`：
 
 ```json
 {
   "SafeLineWAF": {
-    "Server": "https://check-safeline.ihk-one.top/?input="
+    "Server": "http://127.0.0.1:5000/?input="
   }
 }
 ```
 
-离线环境可以将该地址替换为本地服务或通过 SSH 隧道暴露的检测接口。该接口应接收待检测内容作为 GET 参数，并在命中时返回 403。
+接口应接收待检测内容作为 GET 参数，命中恶意内容时返回 HTTP 403。离线环境可留空，工具会使用本地规则继续检测。
 
-### `/usr/bin` 基线
+## `/usr/bin` 基线
 
-`config/info_bin.json` 用于 `/usr/bin` 基线对比。需要更新基线时，可准备同版本干净系统并运行：
+准备同版本干净系统后执行：
 
 ```bash
 AUTOIR_BASELINE_IP=192.168.1.10 \
@@ -107,34 +170,35 @@ AUTOIR_BASELINE_PASSWORD=root \
 uv run python DumpFileInfo.py
 ```
 
-## MCP 使用建议
+## 统一报告输出
 
-1. 首次分析先调用 `get_ssh_client` 建立 SSH 连接。
-2. 连接成功后优先调用 `check_safeline`，确认 WAF 检测能力是否可用。
-3. 按“基础采集 → 专项检测 → 关联验证”推进，避免重复调用已能回答问题的工具。
-4. 没有明确证据时，在结论中标注“需人工复核”。
-
-推荐巡检顺序：连接与 WAF → 用户 → 进程 → 网络 → 文件 → 后门 → 日志 → Rootkit。
-
-## 统一输出样式
-
-Claude 或 Codex 生成应急响应报告时，统一以 AutoIR MCP ASCII 标题开头：
+Claude 最终报告必须以 `AUTOIR_MCP` 艺术字开头：
 
 ```text
-    ___         __        ________  __  ___ ______ ____
-   /   | __  __/ /_____  /  _/ __ \/  |/  // ____// __ \
-  / /| |/ / / / __/ __ \ / // /_/ / /|_/ // /    / /_/ /
- / ___ / /_/ / /_/ /_/ // // _, _/ /  / // /___ / ____/
-/_/  |_\__,_/\__/\____/___/_/ |_/_/  /_/ \____//_/
+ █████╗ ██╗   ██╗████████╗ ██████╗ ██╗██████╗         ███╗   ███╗ ██████╗██████╗
+██╔══██╗██║   ██║╚══██╔══╝██╔═══██╗██║██╔══██╗        ████╗ ████║██╔════╝██╔══██╗
+███████║██║   ██║   ██║   ██║   ██║██║██████╔╝        ██╔████╔██║██║     ██████╔╝
+██╔══██║██║   ██║   ██║   ██║   ██║██║██╔══██╗        ██║╚██╔╝██║██║     ██╔═══╝
+██║  ██║╚██████╔╝   ██║   ╚██████╔╝██║██║  ██║███████╗██║ ╚═╝ ██║╚██████╗██║
+╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═╝╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝ ╚═════╝╚═╝
 ```
 
-报告结构固定为：摘要 → 检测结果 → 风险分析 → 处置建议 → 后续建议。风险等级统一使用：高 / 中 / 低 / 信息 / 未发现明显异常。
+报告结构固定为：摘要 → 检测结果 → 风险分析 → 处置建议 → 后续建议。
+
+检测结果表固定字段：
+
+```markdown
+| 检测项 | 关键发现 | 风险 | 依据 |
+|---|---|---|---|
+```
+
+风险等级只使用：`高`、`中`、`低`、`信息`、`未发现明显异常`。
 
 ## 开发命令
 
 ```bash
 uv sync
-python -m py_compile AutoIR_MCP.py functions.py DumpFileInfo.py
+python -m py_compile AutoIR_MCP.py functions.py DumpFileInfo.py autoir_mcp/*.py autoir_mcp/**/*.py
 uv lock --check
 git diff --check
 ```

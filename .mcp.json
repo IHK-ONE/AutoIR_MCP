@@ -6,9 +6,9 @@
       "args": [
         "run",
         "--project",
-        ".",
+        "/root/AutoIR_MCP",
         "python",
-        "AutoIR_MCP.py"
+        "/root/AutoIR_MCP/AutoIR_MCP.py"
       ],
       "env": {}
     }
