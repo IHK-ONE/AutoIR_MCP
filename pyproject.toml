@@ -1,7 +1,11 @@
 [project]
 name = "autoir-mcp"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "FastMCP tools for automated incident response"
+readme = "readme.md"
 requires-python = ">=3.11.0"
-dependencies = []
+dependencies = [
+    "fastmcp==0.3.3",
+    "paramiko==3.4.0",
+    "requests==2.32.3",
+]

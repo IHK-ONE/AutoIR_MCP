@@ -16,9 +16,9 @@ except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
     server = ""
 
 
-def exec_command(client, command):
+def exec_command(client, command, timeout=None):
     """命令执行函数"""
-    stdin, stdout, stderr = client.exec_command(command)
+    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
     stdout_output = stdout.read().decode().strip()
     stderr_output = stderr.read().decode().strip()
 
