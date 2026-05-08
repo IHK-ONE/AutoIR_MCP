@@ -18,15 +18,36 @@ except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
 
 def exec_command(client, command, timeout=None):
     """命令执行函数"""
-    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-    stdout_output = stdout.read().decode().strip()
-    stderr_output = stderr.read().decode().strip()
+    result = {'status': False, 'result': '', 'stderr': '', 'exit_status': None, 'error': ''}
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        stdout_output = stdout.read().decode(errors='ignore').strip()
+        stderr_output = stderr.read().decode(errors='ignore').strip()
+        exit_status = stdout.channel.recv_exit_status()
 
-    result = {'status': False, 'result': stderr_output}
-    if stdout_output:
-        result.update({'status': True, 'result': stdout_output})
+        result.update({
+            'status': exit_status == 0,
+            'result': stdout_output or stderr_output,
+            'stderr': stderr_output,
+            'exit_status': exit_status,
+        })
+        return result
+    except Exception as error:
+        result.update({'result': str(error), 'error': str(error)})
+        return result
 
-    return result
+
+def command_ok(result):
+    return bool(result and result.get('status') and result.get('result'))
+
+
+def first_success(client, commands, timeout=None):
+    last_result = {'status': False, 'result': '', 'stderr': '', 'exit_status': None, 'error': 'no command executed'}
+    for command in commands:
+        last_result = exec_command(client, command, timeout=timeout)
+        if command_ok(last_result):
+            return last_result
+    return last_result
 
 
 def sftp_download(client, origin_path, download_path):

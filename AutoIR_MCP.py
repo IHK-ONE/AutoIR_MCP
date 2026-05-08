@@ -164,6 +164,31 @@ def file_md5(path):
     return digest.hexdigest()
 
 
+def empty_result(message='未发现明显异常'):
+    return message
+
+
+def command_failure(result, action='命令执行失败'):
+    detail = result.get('error') or result.get('stderr') or result.get('result') or '无错误详情'
+    return f'{action}: {detail}'
+
+
+def count_ips_from_lines(lines):
+    counts = {}
+    for line in lines:
+        ip_match = re.search(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', line)
+        if ip_match:
+            ip = ip_match.group()
+            counts[ip] = counts.get(ip, 0) + 1
+    return counts
+
+
+def format_ip_counts(counts, label):
+    if not counts:
+        return ''
+    return '\n'.join(f'ip: {ip}\tcount: {count}\t[!] {label}' for ip, count in counts.items())
+
+
 def check_export(filename, data):
     try:
         export_list = re.findall(r'export (.*)=(.*)', data)
@@ -417,29 +442,35 @@ def check_sudoers():
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
-    result = exec_command(ssh_session.client, f'cat /etc/sudoers')
     output = []
+    result = first_success(ssh_session.client, [
+        'cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null',
+        'cat /etc/sudoers 2>/dev/null',
+    ])
 
-    if result['status'] and result['result']:
-        get_group()
+    if not result['status']:
+        return command_failure(result, 'sudoers 读取失败')
+    if not result['result']:
+        return empty_result()
 
-        for line in result['result'].splitlines():
-            line = line.strip()
-            if ('ALL=(ALL)' in line or 'ALL=(root)' in line) and not line.startswith('#'):
-                parts = line.split()
-                if len(parts) > 0:
-                    user_or_group = parts[0]
+    get_group()
+    for line in result['result'].splitlines():
+        line = line.strip()
+        if ('ALL=(ALL)' in line or 'ALL=(root)' in line) and not line.startswith('#'):
+            parts = line.split()
+            if len(parts) > 0:
+                user_or_group = parts[0]
 
-                    if user_or_group.startswith('%'):  # 组
-                        group_name = user_or_group[1:]
-                        users_in_group = ssh_session.group_list.get(group_name, [])
-                        tmp = f'group: {group_name}\tuser: {", ".join(users_in_group)}'
-                        output.append(f'{tmp}\t[!] sudo 权限组异常')
-                    else:
-                        tmp = f'{"user: " + user_or_group}'
-                        output.append(f'{tmp}\t[!] sudo 权限组异常')
+                if user_or_group.startswith('%'):
+                    group_name = user_or_group[1:]
+                    users_in_group = ssh_session.group_list.get(group_name, [])
+                    tmp = f'group: {group_name}\tuser: {", ".join(users_in_group)}'
+                    output.append(f'{tmp}\t[!] sudo 权限组异常')
+                else:
+                    tmp = f'{"user: " + user_or_group}'
+                    output.append(f'{tmp}\t[!] sudo 权限组异常')
 
-    return '\n'.join(output)
+    return '\n'.join(output) or empty_result()
 
 
 check_proc = json.load(open(os.path.join(base_dir, 'config', 'info_proc.json'), encoding='utf-8'))
@@ -673,14 +704,18 @@ def check_mount():
     output = ''
 
     result = exec_command(ssh_session.client, f'cat /proc/mounts')
-    if result['status'] and result['result']:
-        try:
-            for pid in re.findall(r'/proc/(\d+)', result['result']):
-                output += f'path: /proc/{pid}\t[!] mount 挂载后门\n'
-        except re.error:
-            pass
+    if not result['status']:
+        return command_failure(result, '挂载信息读取失败')
+    if not result['result']:
+        return empty_result()
 
-    return output
+    try:
+        for pid in re.findall(r'/proc/(\d+)', result['result']):
+            output += f'path: /proc/{pid}\t[!] mount 挂载后门\n'
+    except re.error:
+        pass
+
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -695,18 +730,26 @@ def get_localhost():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
     ssh_session.ip_list = ["127.0.0.1", "localhost", "0.0.0.0"]
-    result = exec_command(ssh_session.client, 'ip -4 addr show')
+    result = first_success(ssh_session.client, ['ip -4 addr show', 'hostname -I'])
 
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            line = line.strip()
-            if "inet" in line:
-                try:
-                    ip = re.split(r'\s+', line)[1].split('/')[0]
-                    if ip not in ssh_session.ip_list:
-                        ssh_session.ip_list.append(ip)
-                except (IndexError, ValueError):
-                    pass
+    if not result['status']:
+        return command_failure(result, '本地 IP 获取失败')
+    if not result['result']:
+        return f"本地IP列表: {', '.join(ssh_session.ip_list)}"
+
+    for line in result['result'].splitlines():
+        line = line.strip()
+        if "inet" in line:
+            try:
+                ip = re.split(r'\s+', line)[1].split('/')[0]
+                if ip not in ssh_session.ip_list:
+                    ssh_session.ip_list.append(ip)
+            except (IndexError, ValueError):
+                pass
+        else:
+            for ip in line.split():
+                if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', ip) and ip not in ssh_session.ip_list:
+                    ssh_session.ip_list.append(ip)
 
     return f"本地IP列表: {', '.join(ssh_session.ip_list)}"
 
@@ -723,27 +766,35 @@ def check_network():
 
     output = []
 
-    result = exec_command(ssh_session.client, 'ss -anutp')
-    if result.get('status') and result.get('result'):
-        for line in result['result'].splitlines()[1:]:
-            try:
-                parts = re.split(r'\s+', line.strip())
-                if len(parts) >= 6:
-                    local, remote, pid_program = parts[4], parts[5], parts[-1]
-                    local_addr, local_port = local.rsplit(':', 1)
-                    remote_addr, remote_port = remote.rsplit(':', 1)
+    result = first_success(ssh_session.client, ['ss -anutp', 'netstat -anutp 2>/dev/null'])
+    if not result.get('status'):
+        return command_failure(result, '网络连接获取失败')
+    if not result.get('result'):
+        return empty_result()
 
-                    if remote_addr not in ssh_session.ip_list and remote_port != "*":
-                        output.append(
-                            f'local :{local}\tremote :{remote}\tpid :{pid_program}\t[!] 发现远程连接')
-                    elif local_port and local_port != "*":
-                        output.append(
-                            f'local :{local}\tremote :{remote}\tpid :{pid_program}\t[!] 发现开启端口')
+    for line in result['result'].splitlines()[1:]:
+        try:
+            parts = re.split(r'\s+', line.strip())
+            if not parts:
+                continue
+            if parts[0] in ('tcp', 'udp', 'tcp6', 'udp6') and len(parts) >= 5:
+                local, remote, pid_program = parts[3], parts[4], parts[-1]
+            elif len(parts) >= 6:
+                local, remote, pid_program = parts[4], parts[5], parts[-1]
+            else:
+                continue
 
-            except (IndexError, ValueError):
-                pass
+            local_addr, local_port = local.rsplit(':', 1)
+            remote_addr, remote_port = remote.rsplit(':', 1)
 
-    return '\n'.join(output)
+            if remote_addr not in ssh_session.ip_list and remote_port != "*":
+                output.append(f'local :{local}\tremote :{remote}\tpid :{pid_program}\t[!] 发现远程连接')
+            elif local_port and local_port != "*":
+                output.append(f'local :{local}\tremote :{remote}\tpid :{pid_program}\t[!] 发现开启端口')
+        except (IndexError, ValueError):
+            pass
+
+    return '\n'.join(output) or empty_result()
 
 
 @mcp.tool()
@@ -777,22 +828,29 @@ def check_hosts():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
     output = ''
+    standard_hosts = {'127.0.0.1', '127.0.1.1', '::1', 'ff02::1', 'ff02::2'}
 
     result = exec_command(ssh_session.client, f'cat /etc/hosts')
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            line = line.strip()
-            try:
-                parts = re.split(r'\s+', line.strip())
-                if parts and not parts[0].startswith('#'):
-                    ip, *domains = parts
-                    if ip and ip not in ssh_session.ip_list:
-                        ssh_session.ip_list.append(ip)
-                        output += f'ip: {ip}\tdomain: {"、".join(domains)}\t[!] 恶意 ip 解析域名\n'
-            except (IndexError, ValueError):
-                pass
+    if not result['status']:
+        return command_failure(result, 'hosts 读取失败')
+    if not result['result']:
+        return empty_result()
 
-    return output
+    for line in result['result'].splitlines():
+        line = line.strip()
+        try:
+            parts = re.split(r'\s+', line.strip())
+            if parts and not parts[0].startswith('#'):
+                ip, *domains = parts
+                if ip in standard_hosts or not domains:
+                    continue
+                if ip and ip not in ssh_session.ip_list:
+                    ssh_session.ip_list.append(ip)
+                    output += f'ip: {ip}\tdomain: {"、".join(domains)}\t[!] 非本机 hosts 解析\n'
+        except (IndexError, ValueError):
+            pass
+
+    return output or empty_result()
 
 
 check_bin_json = json.load(open(os.path.join(base_dir, 'config', 'info_bin.json'), encoding='utf-8'))
@@ -806,8 +864,8 @@ def is_safe_path(basedir, path):
         return False
 
 
-def extract_tar_member_safely(tar, member, destination):
-    if member.issym() or member.islnk() or member.isdev():
+def extract_tar_member_safely(tar, member, destination, max_member_size=20 * 1024 * 1024):
+    if member.issym() or member.islnk() or member.isdev() or member.size > max_member_size:
         return False
     target_path = Path(destination) / member.name
     if not is_safe_path(destination, target_path):
@@ -847,11 +905,15 @@ def check_bin():
 
             check_out = []
             if filename in check_bin_json:
-                if perm != check_bin_json[filename]['perm']:
+                baseline = check_bin_json[filename]
+                if baseline.get('perm') is None or baseline.get('owner') is None or baseline.get('group') is None:
+                    check_out.append('基线缺字段')
+                if baseline.get('perm') is not None and perm != baseline.get('perm'):
                     check_out.append('权限异常')
-                if owner != check_bin_json[filename]['owner'] or group != check_bin_json[filename]['group']:
-                    check_out.append('所属异常')
-                if link != check_bin_json[filename]['link']:
+                if baseline.get('owner') is not None and baseline.get('group') is not None:
+                    if owner != baseline.get('owner') or group != baseline.get('group'):
+                        check_out.append('所属异常')
+                if baseline.get('link') is not None and link != baseline.get('link'):
                     check_out.append('恶意链接')
             else:
                 check_out.append("不常见命令")
@@ -876,7 +938,7 @@ def check_bin():
                     if check_bin_json[Path(file_path).name].get('type') != file_type:
                         output += f'file path: {file_path}\tfile type: {file_type}\t[!] 文件类型错误\n'
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -890,16 +952,21 @@ def check_tmp():
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
-    output = ''
-    result = exec_command(ssh_session.client, 'find /tmp -type f 2>/dev/null')
-    if result['status'] and result['result']:
-        output = ''.join(
-            [f'file path: {item.strip()}\t[!] /tmp 目录下可疑文件\n' for item in result['result'].splitlines()])
-    return output
+    result = first_success(ssh_session.client, [
+        "find /tmp -type f -printf '%p\t%u:%g\t%m\t%s bytes\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null",
+        'find /tmp -type f 2>/dev/null',
+    ])
+    if not result['status']:
+        return command_failure(result, '/tmp 文件扫描失败')
+    if not result['result']:
+        return empty_result()
+
+    output = ''.join(f'file path: {item.strip()}\t[!] /tmp 目录下可疑文件\n' for item in result['result'].splitlines())
+    return output or empty_result()
 
 
 @mcp.tool()
-def check_webshell(path='/var/www/html'):
+def check_webshell(path='/var/www/html', max_files=20000):
     """
     扫描 webroot 中的疑似 WebShell。
     调用：传入站点目录，工具会打包下载并调用本地扫描器分析。
@@ -910,22 +977,43 @@ def check_webshell(path='/var/www/html'):
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
     output = ''
+    try:
+        max_files = max(1, min(int(max_files), 100000))
+    except (TypeError, ValueError):
+        max_files = 20000
     path = path.strip() or '/var/www/html'
     quoted_path = quote_remote_path(path)
 
     result = exec_command(ssh_session.client, f'find {quoted_path} -type f 2>/dev/null')
+    if not result['status']:
+        return command_failure(result, 'webroot 文件枚举失败')
+    if not result['result']:
+        return empty_result('webroot 目录未发现文件')
+
+    file_count = len(result['result'].splitlines())
+    if file_count > max_files:
+        return f'webroot 文件数量 {file_count} 超过限制 {max_files}，请缩小扫描目录或提高 max_files'
+
     if result['status'] and result['result']:
-        exec_command(ssh_session.client, f'cd {quoted_path} && tar -zcf /tmp/webroot.tar.gz .')
+        tar_result = exec_command(ssh_session.client, f'cd {quoted_path} && tar -zcf /tmp/webroot.tar.gz .')
+        if not tar_result['status'] and tar_result.get('stderr'):
+            return command_failure(tar_result, 'webroot 打包失败')
         local_path = Path(base_dir) / 'downloads' / get_time_path()
         local_path.mkdir(parents=True, exist_ok=True)
         archive_path = local_path / 'webroot.tar.gz'
         sftp_download(ssh_session.client, '/tmp/webroot.tar.gz', str(archive_path))
+        if not archive_path.exists():
+            return 'webroot 下载失败：未生成本地压缩包'
 
         with tarfile.open(archive_path, 'r:gz') as tar:
+            member_count = 0
             for member in tar:
+                member_count += 1
+                if member_count > max_files:
+                    return output + f'压缩包成员数量超过限制 {max_files}，已停止解压'
                 if not extract_tar_member_safely(tar, member, local_path):
                     server_path = path.rstrip('/') + '/' + member.name.replace('\\', '/')
-                    output += f'file path: {server_path}\t[!] 路径遍历已拦截\n'
+                    output += f'file path: {server_path}\t[!] 路径/类型/大小异常已拦截\n'
 
         scanner_path = Path(base_dir) / 'extensions' / 'HeMa' / 'hm.exe'
         try:
@@ -948,7 +1036,7 @@ def check_webshell(path='/var/www/html'):
                     file_path = Path(file_path)
                     server_path = str(file_path).replace(str(local_path), path.strip()).replace('\\', '/')
                     output += f'file path: {server_path}\tmd5: {file_md5(file_path)}\t[!] 疑似 webshell 文件\n'
-    return output
+    return output or empty_result('未发现疑似 webshell')
 
 
 def get_files(directory):
@@ -994,8 +1082,10 @@ def check_ld_so_preload():
             line = line.strip()
             if line and not line.startswith('#'):
                 output += f'{line}\t[!] ld.so.preload 后门！\n'
+    elif result.get('exit_status') not in (0, 1):
+        return command_failure(result, 'ld.so.preload 读取失败')
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1018,7 +1108,7 @@ def check_cron():
         for file in get_files(cron_dir):
             output += check_malicious_content(f'{cron_dir}/{file}')
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1114,12 +1204,17 @@ def check_setuid():
 
     output = ''
 
-    result = exec_command(ssh_session.client, "find / ! -path '/proc/*' -type f -perm -4000 2>/dev/null")
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            output += f'command {line.strip()}\t[!] SUID 后门\n'
+    command = r"find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /mnt -o -path /media \) -prune -o -type f -perm -4000 -print 2>/dev/null"
+    result = exec_command(ssh_session.client, command)
+    if not result['status']:
+        return command_failure(result, 'SUID 文件扫描失败')
+    if not result['result']:
+        return empty_result()
 
-    return output
+    for line in result['result'].splitlines():
+        output += f'command {line.strip()}\t[!] SUID 后门\n'
+
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1145,7 +1240,7 @@ def check_startup():
     for file in init_files:
         output += check_malicious_content(f'{file}')
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1164,7 +1259,7 @@ def check_profile():
     for file in get_files('/etc/profile.d'):
         output += check_malicious_content(f'/etc/profile.d/{file}')
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1191,7 +1286,7 @@ def check_rc():
         for file in init_files:
             output += check_malicious_content(f'/home/{user}/{file}')
 
-    return output
+    return output or empty_result()
 
 
 pattern = re.compile(
@@ -1205,7 +1300,7 @@ pattern = re.compile(
 
 
 @mcp.tool()
-def check_log(path='/var/log/apache2/access.log'):
+def check_log(path='/var/log/apache2/access.log', max_lines=5000):
     """
     分析 Apache access.log。
     调用：排查 Web 攻击、恶意 URI、异常状态码和 User-Agent 时使用；path 可指定日志路径。
@@ -1215,19 +1310,34 @@ def check_log(path='/var/log/apache2/access.log'):
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
-    output = ''
+    try:
+        max_lines = max(1, min(int(max_lines), 50000))
+    except (TypeError, ValueError):
+        max_lines = 5000
+
+    output = f'仅分析最近 {max_lines} 行日志\n'
     ssh_session.request_success = {}
     ssh_session.request_jump = {}
     ssh_session.request_others = {}
     ssh_session.user_agents = []
 
-    result = exec_command(ssh_session.client, f'cat {quote_remote_path(path)}')
+    result = exec_command(ssh_session.client, f'tail -n {int(max_lines)} {quote_remote_path(path)} 2>/dev/null')
+    if not result['status']:
+        return command_failure(result, '日志读取失败')
+    if not result['result']:
+        return empty_result('日志为空或无可读内容')
+
     if result['status'] and result['result']:
         access_log = result['result'].splitlines()
+        checked_lines = set()
         for line in access_log:
-            malicious = detect_malicious_text(line.strip())
+            stripped = line.strip()
+            if stripped in checked_lines:
+                continue
+            checked_lines.add(stripped)
+            malicious = detect_malicious_text(stripped)
             if malicious:
-                output += f'url: {urllib.parse.unquote(line.strip())}\t[!] 恶意请求\n'
+                output += f'url: {urllib.parse.unquote(stripped)}\t[!] 恶意请求\n'
 
         for num, match in enumerate(pattern.finditer(result['result'])):
             request = match.groupdict()
@@ -1284,28 +1394,18 @@ def check_login_success():
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
-    output = ''
-    login_success = {}
+    result = first_success(ssh_session.client, [
+        'last',
+        "grep -h 'Accepted' /var/log/auth.log /var/log/secure 2>/dev/null",
+    ])
 
-    result = exec_command(ssh_session.client, 'last')
+    if not result['status']:
+        return command_failure(result, '成功登录日志读取失败')
+    if not result['result']:
+        return empty_result('未发现成功登录 IP')
 
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            line = line.strip()
-            # 匹配 IPv4
-            ip_match = re.search(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', line)
-            if not ip_match:
-                continue
-            ip = ip_match.group()
-            user = line.split()[0]
-            login_success[user] = ip
-            login_success[ip] = login_success.get(ip, 0) + 1
-
-    for ip, count in login_success.items():
-        if '.' in ip:
-            output += f'ip: {ip}\tcount: {count}\t[!] 爆破登入 IP\n'
-
-    return output
+    output = format_ip_counts(count_ips_from_lines(result['result'].splitlines()), '成功登入 IP')
+    return output or empty_result('未发现成功登录 IP')
 
 
 @mcp.tool()
@@ -1319,29 +1419,18 @@ def check_login_fail():
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
-    output = ''
-    login_fail = {}
+    result = first_success(ssh_session.client, [
+        'lastb',
+        "grep -h -E 'Failed password|authentication failure|Invalid user' /var/log/auth.log /var/log/secure 2>/dev/null",
+    ])
 
-    result = exec_command(ssh_session.client, 'lastb')
+    if not result['status']:
+        return command_failure(result, '失败登录日志读取失败')
+    if not result['result']:
+        return empty_result('未发现失败登录 IP')
 
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            line = line.strip()
-            
-            ip_match = re.search(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', line)
-            if not ip_match:
-                continue
-            ip = ip_match.group()
-            user = line.split()[0]
-            login_fail[user] = ip
-            
-            login_fail[ip] = login_fail.get(ip, 0) + 1
-
-    for ip, count in login_fail.items():
-        if '.' in ip:
-            output += f'ip: {ip}\tcount: {count}\t[!] 爆破登入 IP\n'
-
-    return output
+    output = format_ip_counts(count_ips_from_lines(result['result'].splitlines()), '爆破登入 IP')
+    return output or empty_result('未发现失败登录 IP')
 
 
 @mcp.tool()
