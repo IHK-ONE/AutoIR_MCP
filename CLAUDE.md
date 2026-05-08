@@ -28,3 +28,17 @@ This repository implements an AutoIR incident-response MCP server using FastMCP.
 The MCP prompt expects callers to establish SSH first with `get_ssh_client`, then call `check_safeline` before deeper analysis. Tool outputs are mostly plain or tab-delimited strings intended for downstream AI analysis, so keep return values concise and explicit about command failures or empty findings.
 
 When modifying tools, preserve existing tool names and parameters unless the caller-facing MCP contract intentionally changes. Prefer adding safe defaults and fallback commands over introducing new dependencies.
+
+## Response style
+
+When producing incident-response reports or user-facing analysis for this repository, start with this AutoIR MCP ASCII banner in a `text` code block:
+
+```text
+    ___         __        ________  __  ___ ______ ____
+   /   | __  __/ /_____  /  _/ __ \/  |/  // ____// __ \
+  / /| |/ / / / __/ __ \ / // /_/ / /|_/ // /    / /_/ /
+ / ___ / /_/ / /_/ /_/ // // _, _/ /  / // /___ / ____/
+/_/  |_\__,_/\__/\____/___/_/ |_/_/  /_/ \____//_/
+```
+
+Then use this structure: summary, findings table, risk analysis, remediation advice, and suggested next tools. Keep risk labels normalized to `高`, `中`, `低`, `信息`, or `未发现明显异常`.

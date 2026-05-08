@@ -16,7 +16,7 @@ from pathlib import Path
 # 获取当前脚本所在目录
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
-mcp = FastMCP("AutoIR_MCP", instructions="""
+mcp = FastMCP("AutoIR_MCP", instructions=r"""
 你是 AutoIR_MCP，负责通过 SSH 工具协助 Linux 主机应急响应。
 
 使用规则：
@@ -36,10 +36,17 @@ mcp = FastMCP("AutoIR_MCP", instructions="""
 
 默认巡检顺序：连接与 WAF → 用户 → 进程 → 网络 → 文件 → 后门 → 日志 → Rootkit。
 
-输出格式：
-| 检测项 | 关键发现 | 风险 |
-|---|---|---|
-随后给出：1) 风险分析 2) 处置建议 3) 建议继续调用的工具。无异常也要明确写“未发现明显异常”。
+输出规范：
+1. 每次最终报告开头固定输出以下 ASCII 标题，放在 text 代码块中：
+    ___         __        ________  __  ___ ______ ____
+   /   | __  __/ /_____  /  _/ __ \/  |/  // ____// __ \
+  / /| |/ / / / __/ __ \ / // /_/ / /|_/ // /    / /_/ /
+ / ___ / /_/ / /_/ /_/ // // _, _/ /  / // /___ / ____/
+/_/  |_\__,_/\__/\____/___/_/ |_/_/  /_/ \____//_/
+2. 标题后按固定结构输出：摘要 → 检测结果 → 风险分析 → 处置建议 → 后续建议。
+3. 检测结果使用 Markdown 表格：| 检测项 | 关键发现 | 风险 | 依据 |。
+4. 风险等级统一为：高 / 中 / 低 / 信息 / 未发现明显异常。
+5. 无异常也要明确写“未发现明显异常”，命令失败要写明失败原因，不要把失败当作无异常。
 """)
 
 
@@ -1101,8 +1108,7 @@ def check_cron():
 
     output = ''
 
-    cron_dirs = ['/var/spool/cron', '/etc/cron.d', '/etc/cron.daily', '/etc/cron.weekly', '/etc/cron.hourly',
-                 '/etc/cron.monthly']
+    cron_dirs = ['/var/spool/cron', '/etc/cron.d', '/etc/cron.daily', '/etc/cron.weekly', '/etc/cron.hourly', '/etc/cron.monthly']
 
     for cron_dir in cron_dirs:
         for file in get_files(cron_dir):
@@ -1445,8 +1451,7 @@ def RookitUpload():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
     sftp_upload(ssh_session.client, 'extensions/rkhunter.gz', '/tmp/rkhunter.gz')
-    result = exec_command(ssh_session.client,
-                          'cd /tmp && tar -xf /tmp/rkhunter.gz && cd /tmp/rkhunter-1.4.6 && bash installer.sh --install')
+    result = exec_command(ssh_session.client, 'cd /tmp && tar -xf /tmp/rkhunter.gz && cd /tmp/rkhunter-1.4.6 && bash installer.sh --install')
 
     if result['status'] and result['result']:
         if "complete" in result['result']:
