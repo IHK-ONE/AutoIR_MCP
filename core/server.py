@@ -4,8 +4,14 @@ from .functions import (
     check_safe_local,
     check_safe_safeline,
     exec_command,
+    extract_ioc_values,
+    extract_timeline_events,
+    infer_attack_flow,
+    infer_risk_level,
     first_success,
-    format_tool_output,
+    IPV4_PATTERN,
+    normalize_tool_result,
+    result_to_text,
     get_file_list,
     get_time_path,
     is_safe_path,
@@ -14,7 +20,7 @@ from .functions import (
     sftp_upload,
     truncate_text,
 )
-from .prompts import MCP_INSTRUCTIONS, TOOL_CATEGORIES, TOOL_WORKFLOW
+from .prompts import AUTOIR_MCP_BANNER, IR_PLAYBOOKS, MCP_INSTRUCTIONS, TOOL_CATEGORIES, TOOL_WORKFLOW
 from .session import SSHSession
 import paramiko
 import csv
@@ -199,7 +205,185 @@ def get_tool_inventory():
     return {
         "workflow": TOOL_WORKFLOW,
         "categories": TOOL_CATEGORIES,
+        "playbooks": IR_PLAYBOOKS,
     }
+
+
+@mcp.tool()
+def get_ir_playbooks():
+    """
+    获取常用应急响应执行链模板。
+    调用：需要按场景选择工具组合时使用；仅返回建议流程，不自动执行。
+    输出：返回 quick_linux_ir、web_intrusion_ir、persistence_ir、account_ir 模板。
+    """
+    return IR_PLAYBOOKS
+
+
+def ioc_source_text(text='', include_last_triage=True):
+    values = []
+    if text:
+        values.append(str(text))
+    if include_last_triage and getattr(ssh_session, 'last_triage_summary', ''):
+        values.append(ssh_session.last_triage_summary)
+    return '\n'.join(values)
+
+
+def format_ioc_lines(iocs):
+    lines = []
+    labels = {
+        'ips': 'IP',
+        'domains': '域名',
+        'urls': 'URL',
+        'paths': '路径',
+        'ports': '端口',
+    }
+    for key, label in labels.items():
+        values = iocs.get(key) or []
+        lines.append(f'- {label}: {", ".join(values) if values else "未提取到"}')
+    return '\n'.join(lines)
+
+
+def summarize_triage_sections(content, max_sections=12):
+    rows = []
+    current = ''
+    body = []
+    for line in content.splitlines():
+        if line.startswith('## '):
+            if current:
+                rows.append((current, body))
+            current = line[3:].strip()
+            body = []
+        elif current and line.strip():
+            body.append(line.strip())
+    if current:
+        rows.append((current, body))
+
+    findings = []
+    for name, lines in rows[:max_sections]:
+        section_text = '\n'.join(lines) if lines else '无输出'
+        text = next((line for line in lines if not line.startswith('[status=')), section_text)
+        risk = infer_risk_level(section_text)
+        evidence, _ = truncate_text(text, max_chars=160)
+        findings.append(f'| {name} | {evidence.replace("|", "/")} | {risk} | 最近巡检缓存 |')
+    if not findings:
+        findings.append('| 巡检缓存 | 暂无可结构化的工具输出 | 信息 | 需补充检测 |')
+    return '\n'.join(findings)
+
+
+@mcp.tool()
+def extract_iocs(text='', include_last_triage=True):
+    """
+    从输入文本或最近一次巡检缓存提取 IOC。
+    调用：需要从日志、进程、WebShell、巡检摘要中汇总 IP、域名、URL、路径和端口时使用。
+    输出：返回去重后的 IOC 字段，不做外部情报查询。
+    """
+    source = ioc_source_text(text, include_last_triage)
+    if not source.strip():
+        return {"status": False, "result": "没有可提取 IOC 的文本；请传入 text 或先运行 run_quick_triage/run_full_triage"}
+    iocs = extract_ioc_values(source)
+    result = format_ioc_lines(iocs)
+    return {
+        "status": True,
+        "result": result,
+        "iocs": iocs,
+        "data": {"iocs": iocs},
+        "meta": {"tool": "extract_iocs", "risk": "信息", "empty": not any(iocs.values()), "truncated": False, "kind": "dict"},
+    }
+
+
+@mcp.tool()
+def generate_timeline(text='', include_last_triage=True, max_events=100):
+    """
+    从输入文本或最近巡检缓存生成事件时间线。
+    调用：需要复盘入侵过程、梳理日志/文件/登录事件先后顺序时使用。
+    输出：返回按原始材料出现顺序整理的 markdown 时间线表。
+    """
+    source = ioc_source_text(text, include_last_triage)
+    if not source.strip():
+        return normalize_tool_result('generate_timeline', {'status': False, 'result': '没有可提取时间线的文本；请传入 text 或先运行 run_quick_triage/run_full_triage'})
+    events = extract_timeline_events(source, limit=max_events)
+    if not events:
+        return normalize_tool_result('generate_timeline', '未提取到常见时间格式的事件线索')
+    rows = ['| 时间 | 事件 | 来源 |', '|---|---|---|']
+    for item in events:
+        event = item['event'].replace('|', '/')
+        source_name = item['source'].replace('|', '/')
+        rows.append(f'| {item["time"]} | {event} | {source_name} |')
+    result = '\n'.join(rows)
+    normalized = normalize_tool_result('generate_timeline', result)
+    normalized['data'] = {'events': events}
+    return normalized
+
+
+@mcp.tool()
+def generate_report(extra_context='', include_iocs=True):
+    """
+    基于最近巡检缓存生成规范化结论报告。
+    调用：完成 quick/full triage 或专项排查后用于整理交付报告。
+    输出：返回包含 banner、摘要、结果表、风险分析、处置建议和后续建议的报告草稿。
+    """
+    content = ioc_source_text(extra_context, include_last_triage=True)
+    if not content.strip():
+        return '暂无巡检缓存或补充上下文，请先运行 run_quick_triage、run_full_triage 或传入 extra_context'
+
+    triage_type = getattr(ssh_session, 'last_triage_type', '') or 'manual'
+    findings = summarize_triage_sections(content)
+    iocs = extract_ioc_values(content) if include_iocs else {'ips': [], 'domains': [], 'urls': [], 'paths': [], 'ports': []}
+    timeline_events = extract_timeline_events(content, limit=50)
+    attack_flow = infer_attack_flow(content, iocs=iocs, timeline_events=timeline_events)
+    ioc_text = format_ioc_lines(iocs) if include_iocs else '未启用 IOC 提取'
+    has_attack_flow = any(stage['status'] == '发现线索' for stage in attack_flow['stages'])
+    risk_note = '发现可疑线索，需结合原始日志和业务上下文人工复核。' if any(iocs.values()) or '[!]' in content or has_attack_flow else '当前摘要未提取到明确 IOC 或攻击阶段证据，仍需结合工具失败、权限不足和截断情况复核。'
+    summary, truncated = truncate_text(content, max_chars=1200)
+    truncated_note = '；报告摘要已截断' if truncated else ''
+
+    return f'''```text
+{AUTOIR_MCP_BANNER}
+```
+
+## 摘要
+
+- 巡检类型：{triage_type}{truncated_note}
+- 关键摘要：
+
+```text
+{summary}
+```
+
+## 检测结果表
+
+| 检测项 | 关键发现 | 风险 | 依据 |
+|---|---|---|---|
+{findings}
+
+## IOC 摘要
+
+{ioc_text}
+
+## 攻击流程分析
+
+{attack_flow['markdown']}
+
+### 攻击路径判断
+
+{attack_flow['summary']}
+
+## 风险分析
+
+{risk_note}
+
+## 处置建议
+
+- 优先复核风险为 高/中 的工具输出和 IOC 相关文件、进程、网络连接。
+- 对可疑文件先使用 profile_suspicious_file、hash_file、download_file 固化证据，再决定隔离或清除。
+- 对持久化线索复查 cron、systemd、profile/rc、authorized_keys 和 SUID 文件。
+
+## 后续建议
+
+- Web 入侵场景：discover_webroots → check_web_logs_auto → check_webshell → check_recent_files → generate_timeline。
+- 账户入侵场景：check_login_success → check_login_fail → check_ssh_keys → check_history → generate_timeline。
+- 持久化场景：check_persistence_summary → check_recent_systemd_changes → extract_iocs → generate_timeline。
+'''
 
 
 def command_format(check, command):
@@ -238,7 +422,7 @@ def command_failure(result, action='命令执行失败'):
 def count_ips_from_lines(lines):
     counts = {}
     for line in lines:
-        ip_match = re.search(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', line)
+        ip_match = IPV4_PATTERN.search(line)
         if ip_match:
             ip = ip_match.group()
             counts[ip] = counts.get(ip, 0) + 1
@@ -1081,6 +1265,63 @@ def check_recent_files(path='/tmp', days=7, max_results=200):
 
 
 @mcp.tool()
+def discover_webroots(max_results=50):
+    """
+    自动发现常见 Web 根目录。
+    调用：不知道站点目录时使用，后续可接 check_webshell 或 check_recent_files。
+    输出：返回 webroot 路径、来源、存在状态和浅层文件数量。
+    """
+    if not check_session():
+        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+    try:
+        max_results = max(1, min(int(max_results), 200))
+    except (TypeError, ValueError):
+        max_results = 50
+
+    command = r'''for p in /var/www/html /usr/share/nginx/html /www/wwwroot /home/wwwroot /data/wwwroot /srv/www /opt/lampp/htdocs; do [ -d "$p" ] && printf 'common\t%s\n' "$p"; done
+for f in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/apache2/sites-enabled/* /etc/apache2/sites-available/* /etc/httpd/conf/*.conf /etc/httpd/conf.d/*.conf /www/server/panel/vhost/nginx/*.conf /www/server/panel/vhost/apache/*.conf; do
+  [ -f "$f" ] || continue
+  awk '
+    $1 == "root" {gsub(";", "", $2); gsub("\"", "", $2); if ($2 ~ /^\//) printf "config:%s\t%s\n", FILENAME, $2}
+    $1 == "DocumentRoot" {gsub("\"", "", $2); if ($2 ~ /^\//) printf "config:%s\t%s\n", FILENAME, $2}
+  ' "$f" 2>/dev/null
+done'''
+    result = exec_command(ssh_session.client, command, timeout=30, max_bytes=200000)
+    if not result['status'] and not result['result']:
+        return command_failure(result, 'Web 目录发现失败')
+
+    roots = []
+    seen = set()
+    for line in result.get('result', '').splitlines():
+        parts = line.split('\t', 1)
+        if len(parts) != 2:
+            continue
+        source, path = parts[0].strip(), parts[1].strip().rstrip(';')
+        if not path.startswith('/') or path in seen:
+            continue
+        seen.add(path)
+        roots.append((source, path))
+        if len(roots) >= max_results:
+            break
+
+    if not roots:
+        return empty_result('未发现常见 Web 根目录')
+
+    output = []
+    for source, path in roots:
+        quoted = quote_remote_path(path)
+        info = exec_command(
+            ssh_session.client,
+            f"if [ -d {quoted} ]; then count=$(find {quoted} -maxdepth 2 -type f 2>/dev/null | head -n 1001 | wc -l); stat -c '%U:%G\t%A\t%s bytes\t%y' {quoted} 2>/dev/null | sed \"s/^/$count files(max depth 2)\t/\"; else echo 'missing'; fi",
+            timeout=15,
+            max_bytes=4000,
+        )
+        detail = info.get('result', '').strip() if info.get('status') else '状态获取失败'
+        output.append(f'source: {source}\tpath: {path}\t{detail}\t[i] Web 根目录候选')
+    return '\n'.join(output)
+
+
+@mcp.tool()
 def check_webshell(path='/var/www/html', max_files=20000):
     """
     扫描 webroot 中的疑似 WebShell。
@@ -1879,6 +2120,89 @@ def hash_file(path, algorithm='sha256'):
 
 
 @mcp.tool()
+def profile_suspicious_file(path, max_preview_lines=40, max_strings=80):
+    """
+    快速画像目标主机上的可疑文件。
+    调用：需要对单个文件做 stat、hash、类型、预览和字符串片段分析时使用。
+    输出：返回文件元数据、sha256、file 类型、头部预览、strings 片段和风险提示。
+    """
+    if not check_session():
+        return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
+    if not isinstance(path, str) or not path.strip():
+        return {"status": False, "result": "path 不能为空"}
+    try:
+        max_preview_lines = max(1, min(int(max_preview_lines), 200))
+    except (TypeError, ValueError):
+        max_preview_lines = 40
+    try:
+        max_strings = max(1, min(int(max_strings), 300))
+    except (TypeError, ValueError):
+        max_strings = 80
+
+    path = path.strip()
+    quoted = quote_remote_path(path)
+    stat_result = exec_command(
+        ssh_session.client,
+        f"stat -c '%F\t%A\t%a\t%U:%G\t%s\t%y\t%n' {quoted} 2>/dev/null",
+        timeout=10,
+        max_bytes=8000,
+    )
+    if not stat_result['status']:
+        return {"status": False, "path": path, "result": command_failure(stat_result, '文件元数据读取失败')}
+
+    fields = stat_result.get('result', '').split('\t')
+    file_type = fields[0] if len(fields) > 0 else ''
+    permissions = fields[1] if len(fields) > 1 else ''
+    mode = fields[2] if len(fields) > 2 else ''
+    owner = fields[3] if len(fields) > 3 else ''
+    size = fields[4] if len(fields) > 4 else ''
+    mtime = fields[5] if len(fields) > 5 else ''
+
+    sha256_result = exec_command(ssh_session.client, f"sha256sum {quoted} 2>/dev/null", timeout=20, max_bytes=4000)
+    type_result = exec_command(ssh_session.client, f"file -b {quoted} 2>/dev/null", timeout=10, max_bytes=4000)
+    preview_result = exec_command(ssh_session.client, f"head -n {max_preview_lines} {quoted} 2>/dev/null", timeout=10, max_bytes=12000)
+    strings_result = exec_command(ssh_session.client, f"strings -a {quoted} 2>/dev/null | head -n {max_strings}", timeout=20, max_bytes=20000)
+
+    lower_path = path.lower()
+    reasons = []
+    if 'directory' in file_type.lower():
+        reasons.append('目标是目录')
+    if permissions and any(flag in permissions for flag in ('x', 's', 'S')):
+        reasons.append('包含执行权限或 SUID/SGID 标记')
+    if permissions and permissions.endswith('w'):
+        reasons.append('other 可写')
+    if lower_path.endswith(('.php', '.jsp', '.jspx', '.asp', '.aspx', '.war', '.py', '.pl', '.sh')):
+        reasons.append('脚本或 Web 可执行扩展')
+    if any(token in lower_path for token in ('/tmp/', '/dev/shm/', '/var/tmp/', '/uploads/', '/upload/')):
+        reasons.append('位于高频落地目录')
+    if size == '0':
+        reasons.append('空文件')
+
+    sha256 = sha256_result.get('result', '').split()[0] if sha256_result.get('status') and sha256_result.get('result') else ''
+    preview, preview_truncated = truncate_text(preview_result.get('result', ''), max_chars=4000)
+    string_snippets, strings_truncated = truncate_text(strings_result.get('result', ''), max_chars=8000)
+
+    return {
+        "status": True,
+        "path": path,
+        "metadata": {
+            "type": file_type,
+            "permissions": permissions,
+            "mode": mode,
+            "owner": owner,
+            "size": size,
+            "mtime": mtime,
+        },
+        "sha256": sha256,
+        "file": type_result.get('result', '') if type_result.get('status') else 'file 命令不可用或失败',
+        "preview": preview,
+        "strings": string_snippets,
+        "risk_notes": reasons or ['未发现明显文件画像风险点，仍需结合上下文复核'],
+        "truncated": preview_truncated or strings_truncated,
+    }
+
+
+@mcp.tool()
 def download_file(remote_path, local_dir='downloads/evidence', max_bytes=100 * 1024 * 1024):
     """
     下载目标主机文件到本地取证目录。
@@ -2218,13 +2542,9 @@ def run_tool_sequence(tools):
         tool_name = func.__name__
         try:
             value = func()
-            text = format_tool_output(tool_name, value)
-            if not isinstance(text, str):
-                text = json.dumps(text, ensure_ascii=False)
-            text, _ = truncate_text(text, max_chars=60000)
-            results.append(f'## {tool_name}\n{text}')
+            results.append(f'## {tool_name}\n{result_to_text(tool_name, value)}')
         except Exception as error:
-            results.append(f'## {tool_name}\n[ERROR] {error}')
+            results.append(f'## {tool_name}\n[status=failed risk=低]\n[ERROR] {error}')
     return '\n\n'.join(results)
 
 
@@ -2268,14 +2588,14 @@ def run_full_triage(webroot='/var/www/html', include_webshell=True, include_root
     output.append(run_tool_sequence(extra_tools))
     if include_webshell:
         try:
-            output.append(f'## check_webshell\n{check_webshell(path=webroot)}')
+            output.append(f'## check_webshell\n{result_to_text("check_webshell", check_webshell(path=webroot))}')
         except Exception as error:
-            output.append(f'## check_webshell\n[ERROR] {error}')
+            output.append(f'## check_webshell\n[status=failed risk=低]\n[ERROR] {error}')
     if include_rootkit:
         try:
-            output.append(f'## RookitUpload\n{RookitUpload()}')
+            output.append(f'## RookitUpload\n{result_to_text("RookitUpload", RookitUpload())}')
         except Exception as error:
-            output.append(f'## RookitUpload\n[ERROR] {error}')
+            output.append(f'## RookitUpload\n[status=failed risk=低]\n[ERROR] {error}')
     result = '\n\n'.join(output)
     ssh_session.last_triage_type = 'full'
     ssh_session.last_triage_summary = result
