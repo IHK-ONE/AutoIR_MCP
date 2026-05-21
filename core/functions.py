@@ -1,23 +1,47 @@
 import json
-import os.path
 import re
 import time
-import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
 import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_DIR = PROJECT_ROOT / 'config'
-CONFIG_PATH = CONFIG_DIR / 'config.json'
+CONFIG_PATH = PROJECT_ROOT / 'config.json'
+_safeline_server = ''
+_safeline_config_mtime = None
 
-try:
-    with open(CONFIG_PATH, encoding='utf-8') as f:
-        config_data = json.load(f)
-    server = config_data.get('SafeLineWAF', {}).get('Server', '')
-except (FileNotFoundError, KeyError, json.JSONDecodeError):
-    server = ''
+
+def is_safe_path(base_dir, candidate):
+    try:
+        Path(candidate).resolve().relative_to(Path(base_dir).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def is_safe_tar_member(destination, member, max_member_size=20 * 1024 * 1024):
+    if member.issym() or member.islnk() or member.isdev() or member.size > max_member_size:
+        return False
+    if Path(member.name).is_absolute() or ".." in Path(member.name).parts:
+        return False
+    return is_safe_path(destination, Path(destination) / member.name)
+
+
+def truncate_text(value, max_chars=4000):
+    value = value or ""
+    if len(value) <= max_chars:
+        return value, False
+    return value[:max_chars] + "\n[TRUNCATED] output exceeded limit", True
+
+
+def format_tool_output(tool, content, empty_message="未发现明显异常"):
+    if content is None:
+        content = ""
+    if isinstance(content, str):
+        stripped = content.strip()
+        return stripped or f"[EMPTY] {tool}: {empty_message}"
+    return content
 
 
 def append_limited(chunks, current_size, data, max_bytes):
@@ -44,7 +68,6 @@ def exec_command(client, command, timeout=10, max_bytes=1_000_000):
         'exit_status': None,
         'error': '',
         'command': command,
-        'duration_ms': 0,
         'timeout': False,
         'truncated': False,
     }
@@ -81,7 +104,6 @@ def exec_command(client, command, timeout=10, max_bytes=1_000_000):
             'stdout': stdout_output,
             'stderr': stderr_output,
             'exit_status': exit_status,
-            'duration_ms': int((time.monotonic() - started) * 1000),
             'truncated': stdout_truncated or stderr_truncated,
         })
     except TimeoutError as error:
@@ -90,7 +112,6 @@ def exec_command(client, command, timeout=10, max_bytes=1_000_000):
         result.update({
             'result': f'命令超时: {error}',
             'error': str(error),
-            'duration_ms': int((time.monotonic() - started) * 1000),
             'timeout': True,
         })
     except Exception as error:
@@ -99,7 +120,6 @@ def exec_command(client, command, timeout=10, max_bytes=1_000_000):
         result.update({
             'result': str(error),
             'error': str(error),
-            'duration_ms': int((time.monotonic() - started) * 1000),
         })
     return result
 
@@ -180,34 +200,44 @@ def get_time_path():
     return datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
 
 
+MALICIOUS_PATTERN = re.compile(
+    r'bash\s+-i|/dev/tcp/|\bnc\s+|\btelnet\s+|\bcurl\s+.*\|\s*(sh|bash|python|perl)|'
+    r'\bwget\s+.*\|\s*(sh|bash|python|perl)|exec\s+.*socket|base64\s+-d|'
+    r'exec\(base64\.b64decode|\.decode\([\'\"]base64[\'\"]\)|php\s+-r|'
+    r'python\s+-c\s+.*socket|perl\s+-e\s+.*socket',
+    re.IGNORECASE,
+)
+
+
 def check_safe_local(content):
     try:
-        patterns = [
-            r'bash\s+-i', r'/dev/tcp/', r'\bnc\s+', r'\btelnet\s+', r'\bcurl\s+.*\|\s*(sh|bash|python|perl)',
-            r'\bwget\s+.*\|\s*(sh|bash|python|perl)', r'exec\s+.*socket', r'base64\s+-d',
-            r'exec\(base64\.b64decode', r"\.decode\(['\"]base64['\"]\)",
-            r'php\s+-r', r'python\s+-c\s+.*socket', r'perl\s+-e\s+.*socket',
-        ]
-        for pattern in patterns:
-            if re.search(pattern, content, re.IGNORECASE):
-                return content
-        return ''
+        return content if MALICIOUS_PATTERN.search(content) else ''
     except Exception:
+        return ''
+
+
+def get_safeline_server():
+    global _safeline_config_mtime, _safeline_server
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+        if mtime == _safeline_config_mtime:
+            return _safeline_server
+        with open(CONFIG_PATH, encoding='utf-8') as file:
+            _safeline_server = json.load(file).get('SafeLineWAF', {}).get('Server', '').strip()
+        _safeline_config_mtime = mtime
+        return _safeline_server
+    except (OSError, json.JSONDecodeError, AttributeError):
+        _safeline_server = ''
+        _safeline_config_mtime = None
         return ''
 
 
 def check_safe_safeline(content):
+    server = get_safeline_server()
     if not server:
         return ''
     try:
-        separator = '&' if '?' in server else '?'
-        if server.endswith(('=', '/', '?', '&')):
-            url = server + urllib.parse.quote_plus(content)
-        else:
-            url = f'{server}{separator}input={urllib.parse.quote_plus(content)}'
-        response = requests.get(url, timeout=3)
-        if response.status_code == 403:
-            return content
-        return ''
-    except Exception:
+        response = requests.get(server, params={'input': content}, timeout=5)
+        return content if response.status_code == 403 else ''
+    except requests.RequestException:
         return ''

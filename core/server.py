@@ -1,14 +1,24 @@
 from fastmcp import FastMCP
-from .functions import *
-from .prompts import MCP_INSTRUCTIONS
-from .schemas import format_tool_output
+from .functions import (
+    PROJECT_ROOT,
+    check_safe_local,
+    check_safe_safeline,
+    exec_command,
+    first_success,
+    format_tool_output,
+    get_file_list,
+    get_time_path,
+    is_safe_path,
+    is_safe_tar_member,
+    sftp_download,
+    sftp_upload,
+    truncate_text,
+)
+from .prompts import MCP_INSTRUCTIONS, TOOL_CATEGORIES, TOOL_WORKFLOW
 from .session import SSHSession
-from .utils.path_safety import is_safe_path, is_safe_tar_member
 import paramiko
-import os
 import csv
 import json
-import urllib
 import tarfile
 import hashlib
 import subprocess
@@ -18,51 +28,30 @@ import shlex
 import urllib.parse
 from pathlib import Path
 
-base_dir = str(Path(__file__).resolve().parents[1])
+base_dir = str(PROJECT_ROOT)
 
 mcp = FastMCP("AutoIR_MCP", instructions=MCP_INSTRUCTIONS)
 
 
-ssh_session = SSHSession(0)
+ssh_session = SSHSession(None)
 
 
-def check_session():
+def check_session(probe=False):
     global ssh_session
     if ssh_session is None or ssh_session.client is None:
         return False
     try:
-        ssh_session.client.exec_command('echo test', timeout=5)
-        return True
+        transport = ssh_session.client.get_transport()
+        if transport is None or not transport.is_active():
+            return False
+        if hasattr(transport, 'is_authenticated') and not transport.is_authenticated():
+            return False
+        if not probe:
+            return True
+        result = exec_command(ssh_session.client, 'true', timeout=5, max_bytes=1000)
+        return bool(result.get('status'))
     except Exception:
         return False
-
-
-READONLY_DENIED_PATTERNS = (
-    r'(^|\s)(rm|mv|cp|chmod|chown|kill|pkill|reboot|shutdown|halt|poweroff|mkfs|dd)\b',
-    r'(^|\s)(apt|yum|dnf|apk|pip|npm|gem)\s+(install|remove|erase|upgrade|update)\b',
-    r'\b(systemctl|service)\s+(start|stop|restart|reload|enable|disable)\b',
-    r'(^|[^<])>>?\s*\S+',
-    r'\|\s*(sh|bash|python|perl)\b',
-    r'\b(curl|wget)\b.*\|',
-)
-
-READONLY_ALLOWED_PREFIXES = (
-    'cat ', 'grep ', 'egrep ', 'fgrep ', 'awk ', 'sed ', 'head ', 'tail ', 'ls ', 'find ', 'stat ',
-    'file ', 'strings ', 'ps ', 'ss ', 'netstat ', 'lsof ', 'ip ', 'hostname', 'uname', 'date',
-    'uptime', 'who', 'w', 'last', 'lastb', 'systemctl ', 'journalctl ', 'crontab ', 'atq',
-    'docker ps', 'docker inspect', 'docker top', 'podman ps', 'podman inspect', 'podman top'
-)
-
-
-def validate_readonly_command(command):
-    normalized = command.strip()
-    lower = normalized.lower()
-    for pattern in READONLY_DENIED_PATTERNS:
-        if re.search(pattern, lower):
-            return normalized, f"readonly_shell 拒绝非只读命令: {command}"
-    if not lower.startswith(READONLY_ALLOWED_PREFIXES):
-        return normalized, f"readonly_shell 仅允许常见只读命令: {command}"
-    return normalized, ''
 
 
 @mcp.tool()
@@ -89,7 +78,13 @@ def get_ssh_client(ip, port=22, username='root', password=''):
 
     try:
         client.connect(ip, port=port, username=username, password=password, timeout=30)
+        old_client = ssh_session.client if ssh_session and ssh_session.client else None
         ssh_session = SSHSession(client)
+        if old_client:
+            try:
+                old_client.close()
+            except Exception:
+                pass
         return {"status": True, "result": "SSH 连接成功"}
 
     except paramiko.AuthenticationException:
@@ -107,7 +102,7 @@ def check_ssh_session():
     调用：需要确认是否已连接目标主机、连接是否仍可用时使用。
     输出：返回 connected 状态和说明。
     """
-    connected = check_session()
+    connected = check_session(probe=True)
     return {
         "status": connected,
         "connected": connected,
@@ -149,7 +144,11 @@ def reset_session(close_connection=True):
             pass
         ssh_session = SSHSession(None)
         return {"status": True, "result": "会话状态已重置，SSH 连接已关闭"}
-    ssh_session = SSHSession(old_client)
+    if ssh_session is None:
+        ssh_session = SSHSession(old_client)
+    else:
+        ssh_session.client = old_client
+        ssh_session.reset_analysis_state()
     return {"status": True, "result": "会话状态已重置，SSH 连接保持不变"}
 
 
@@ -158,7 +157,7 @@ def shell(command, timeout=10, max_bytes=200000):
     """
     在已连接的 SSH 目标主机上执行 shell 命令。
     调用：需要 AI 直接通过 MCP 对目标机执行命令时使用，不使用本地 Bash；必须先调用 get_ssh_client。
-    输出：返回远程命令、退出码、stdout、stderr、耗时和截断状态。
+    输出：返回 exec_command 的统一执行结果。
     """
     if not check_session():
         return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
@@ -173,33 +172,8 @@ def shell(command, timeout=10, max_bytes=200000):
     except (TypeError, ValueError):
         max_bytes = 200000
 
-    result = exec_command(ssh_session.client, command.strip(), timeout=timeout, max_bytes=max_bytes)
-    return {
-        "status": result.get("status"),
-        "command": result.get("command"),
-        "exit_status": result.get("exit_status"),
-        "stdout": result.get("stdout", ""),
-        "stderr": result.get("stderr", ""),
-        "error": result.get("error", ""),
-        "duration_ms": result.get("duration_ms"),
-        "timeout": result.get("timeout"),
-        "truncated": result.get("truncated"),
-    }
+    return exec_command(ssh_session.client, command.strip(), timeout=timeout, max_bytes=max_bytes)
 
-
-@mcp.tool()
-def readonly_shell(command, timeout=10, max_bytes=200000):
-    """
-    在 SSH 目标主机上执行取证友好的只读命令。
-    调用：AI 默认需要直接查看目标机信息时优先使用；它不是安全沙箱，只用于减少误操作。
-    输出：同 shell，但会拒绝明显写入、破坏或交互类命令。
-    """
-    if not isinstance(command, str) or not command.strip():
-        return {"status": False, "result": "command 不能为空"}
-    normalized, error = validate_readonly_command(command)
-    if error:
-        return {"status": False, "result": error}
-    return shell(normalized, timeout=timeout, max_bytes=max_bytes)
 
 
 @mcp.tool()
@@ -209,11 +183,23 @@ def check_safeline():
     调用：SSH 连接成功后优先调用一次，用于后续恶意命令/请求辅助判断。
     输出：返回 WAF 存活状态。
     """
-    ssh_session.safeline_server = check_safe_safeline('bash -i')
-    if ssh_session.safeline_server:
-        return '雷池 WAF 服务存活。。。'
-    else:
-        return '雷池 WAF 未存活，继续运行。。。'
+    ssh_session.safeline_available = bool(check_safe_safeline('bash -i'))
+    if ssh_session.safeline_available:
+        return {"status": True, "result": "雷池 WAF 服务存活"}
+    return {"status": False, "result": "雷池 WAF 未存活，继续运行"}
+
+
+@mcp.tool()
+def get_tool_inventory():
+    """
+    获取 MCP 工具清单和推荐流程。
+    调用：需要了解可用工具、工具分组或默认排查顺序时使用。
+    输出：返回工具分类和推荐流程。
+    """
+    return {
+        "workflow": TOOL_WORKFLOW,
+        "categories": TOOL_CATEGORIES,
+    }
 
 
 def command_format(check, command):
@@ -224,9 +210,11 @@ def quote_remote_path(path):
     return shlex.quote(str(path))
 
 
-def detect_malicious_text(content):
+def detect_malicious_text(content, use_safeline=True):
     malicious_local = check_safe_local(content)
-    malicious_safeline = check_safe_safeline(content) if ssh_session.safeline_server else ''
+    if not use_safeline or not ssh_session.safeline_available:
+        return malicious_local
+    malicious_safeline = check_safe_safeline(content)
     return malicious_local + malicious_safeline
 
 
@@ -269,8 +257,7 @@ def check_export(filename, data):
         for key, value in export_list:
             if key in ('PATH', 'LD_PRELOAD', 'LD_AOUT_PRELOAD', 'LD_ELF_PRELOAD', 'LD_LIBRARY_PATH',
                        'PROMPT_COMMAND') and value != '"$PATH:${snap_bin_path}"':
-                ssh_session.hijack_list.append(f'[+] 环境变量劫持: {key}')
-            ssh_session.hijack_output.append(f'filename: {filename}\texport {key}={value}\t[!] 环境变量劫持')
+                ssh_session.hijack_output.append(f'filename: {filename}\texport {key}={value}\t[!] 环境变量劫持')
     except (TypeError, ValueError):
         pass
 
@@ -296,22 +283,21 @@ def check_hijack():
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
-    # 常规目录环境变量排查
+    ssh_session.hijack = False
+    ssh_session.hijack_output = []
+
     common_files = ['/root/.bashrc', '/root/.tcshrc', '/root/.bash_profile', '/root/.cshrc', '/etc/bashrc',
                     '/etc/profile', '/etc/csh.login', '/etc/csh.cshrc']
     home_files = ['.bashrc', '.bash_profile', '.tcshrc', '.cshrc']
 
-    # 检查是否被劫持
     result = exec_command(ssh_session.client, 'ls -al .')
     if result['status'] and result['result'][:5] != 'total':
         result = exec_command(ssh_session.client, 'env -i /usr/bin/ls -al .')
         if result['status'] and result['result'][:5] == 'total':
             ssh_session.hijack = True
 
-    # 处理常规文件
     process_files(common_files)
 
-    # 处理 /etc/profile.d/ 目录下的文件
     profile_d_files = []
     profile_d_command = command_format(ssh_session.hijack, 'ls -al /etc/profile.d/')
     profile_d_result = exec_command(ssh_session.client, profile_d_command)
@@ -319,7 +305,6 @@ def check_hijack():
         profile_d_files = [file['filename'] for file in get_file_list(profile_d_result['result']).values()]
     process_files(profile_d_files, '/etc/profile.d/')
 
-    # 处理 HOME 目录下的用户文件
     home_dir_command = command_format(ssh_session.hijack, 'ls -al /home')
     home_dir_result = exec_command(ssh_session.client, home_dir_command)
     if home_dir_result['status'] and home_dir_result['result']:
@@ -330,7 +315,6 @@ def check_hijack():
 
 
 def extract_users_from_output(output):
-    """ ssh_key 用户名提取 """
     return [line.strip().split()[-1] for line in output.splitlines() if line.strip()]
 
 
@@ -339,13 +323,14 @@ def get_group():
     if result['status'] and result['result']:
         for line in result['result'].splitlines():
             parts = line.strip().split(':')
-            # 组名:密码:占位符 GID:组内用户
             if len(parts) >= 4:
                 group_name, _, _, users = parts
                 ssh_session.group_list[group_name] = [user.strip() for user in users.split(',') if user.strip()]
 
 
-def load_home_users():
+def load_home_users(force=False):
+    if ssh_session.user_list and not force:
+        return ssh_session.user_list
     result = exec_command(ssh_session.client, 'ls -al /home')
     if result['status'] and result['result']:
         ssh_session.user_list = [file['filename'] for file in get_file_list(result['result']).values()]
@@ -388,12 +373,10 @@ def check_history():
     if not ssh_session.user_list:
         check_home_nomcp()
 
-    # 检查 root 用户的 bash_history
     result = exec_command(ssh_session.client, f'cat /root/.bash_history')
     if result['status'] and result['result']:
         output.append(f'[!] 存在 bash_history: /root/.bash_history')
 
-    # 检查其他用户的 bash_history
     for user in ssh_session.user_list:
         result = exec_command(ssh_session.client, f'cat /home/{user}/.bash_history')
         if result['status'] and result['result']:
@@ -455,7 +438,6 @@ def check_ssh_keys():
     if not ssh_session.user_list:
         check_home_nomcp()
 
-    # 检查 root 用户的 authorized_keys
     result = exec_command(ssh_session.client, f'cat /root/.ssh/authorized_keys')
     if result['status'] and result['result']:
         users = ', '.join(extract_users_from_output(result['result']))
@@ -465,7 +447,6 @@ def check_ssh_keys():
     if result['status'] and result['result']:
         output.append(f'{result["result"]}\t[!] 存在 SSH authorized_keys')
 
-    # 检查其他用户的 authorized_keys
     for user in ssh_session.user_list:
         result = exec_command(ssh_session.client, f'cat /home/{user}/.ssh/authorized_keys')
         if result['status'] and result['result']:
@@ -547,7 +528,6 @@ def check_sudoers():
     return '\n'.join(output) or empty_result()
 
 
-check_proc = json.load(open(os.path.join(base_dir, 'config', 'info_proc.json'), encoding='utf-8'))
 privilege_escalation = ['aa-exec', 'ansible-playbook', 'ansible-test', 'aoss', 'apt-get', 'apt', 'ash', 'at', 'awk',
                         'aws', 'bash', 'batcat', 'bconsole', 'bundle', 'bundler', 'busctl', 'busybox', 'byebug', 'c89',
                         'c99', 'cabal', 'capsh', 'cdist', 'certbot', 'check_by_ssh', 'choom', 'cobc', 'composer',
@@ -755,9 +735,8 @@ def check_exe():
                     if int(pid) in ssh_session.ps:
                         exe = ssh_session.ps[int(pid)]['exe']
 
-                        if (true_exe != exe) and (((true_exe in check_proc) and (exe not in check_proc[true_exe])) or (
-                                true_exe not in check_proc)):
-                            output += f'PID: {pid}\ttrue_exe: {true_exe}\texe: {exe}\t[!]"命令被替换\n'
+                        if true_exe != exe:
+                            output += f'PID: {pid}\ttrue_exe: {true_exe}\texe: {exe}\t[!] 进程名与真实可执行文件不一致，需结合上下文复核\n'
             except ValueError:
                 pass
 
@@ -828,6 +807,31 @@ def get_localhost():
     return f"本地IP列表: {', '.join(ssh_session.ip_list)}"
 
 
+def parse_socket_line(line):
+    line = line.strip()
+    if not line or line.lower().startswith(('netid', 'proto', 'active')):
+        return None
+    parts = re.split(r'\s+', line)
+    if len(parts) < 5 or parts[0] not in ('tcp', 'udp', 'tcp6', 'udp6'):
+        return None
+    if len(parts) >= 6 and parts[1].upper() in {'LISTEN', 'UNCONN', 'ESTAB', 'ESTABLISHED', 'TIME-WAIT'}:
+        state = parts[1]
+        local = parts[4]
+        remote = parts[5]
+    else:
+        state = next((part for part in parts if part.upper() in {'LISTEN', 'UNCONN', 'ESTABLISHED'}), '')
+        local = parts[3]
+        remote = parts[4]
+    process = parts[-1] if '/' in parts[-1] or 'users:' in parts[-1] else ''
+    return {
+        'proto': parts[0],
+        'local': local,
+        'remote': remote,
+        'state': state,
+        'process': process,
+    }
+
+
 @mcp.tool()
 def check_network():
     """
@@ -848,27 +852,52 @@ def check_network():
 
     for line in result['result'].splitlines()[1:]:
         try:
-            parts = re.split(r'\s+', line.strip())
-            if not parts:
+            socket = parse_socket_line(line)
+            if not socket:
                 continue
-            if parts[0] in ('tcp', 'udp', 'tcp6', 'udp6') and len(parts) >= 5:
-                local, remote, pid_program = parts[3], parts[4], parts[-1]
-            elif len(parts) >= 6:
-                local, remote, pid_program = parts[4], parts[5], parts[-1]
-            else:
-                continue
-
+            local = socket['local']
+            remote = socket['remote']
+            process = socket['process'] or '-'
             local_addr, local_port = local.rsplit(':', 1)
             remote_addr, remote_port = remote.rsplit(':', 1)
 
             if remote_addr not in ssh_session.ip_list and remote_port != "*":
-                output.append(f'local :{local}\tremote :{remote}\tpid :{pid_program}\t[!] 发现远程连接')
+                output.append(f'local :{local}\tremote :{remote}\tpid :{process}\t[!] 发现远程连接')
             elif local_port and local_port != "*":
-                output.append(f'local :{local}\tremote :{remote}\tpid :{pid_program}\t[!] 发现开启端口')
+                output.append(f'local :{local}\tremote :{remote}\tpid :{process}\t[!] 发现开启端口')
         except (IndexError, ValueError):
             pass
 
     return '\n'.join(output) or empty_result()
+
+
+@mcp.tool()
+def check_listening_ports():
+    """
+    汇总监听端口。
+    调用：需要快速确认目标主机暴露服务、监听地址和关联进程时使用。
+    输出：返回协议、本地监听地址、状态和进程线索。
+    """
+    if not check_session():
+        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+
+    result = first_success(ssh_session.client, ['ss -lntup', 'netstat -lntup 2>/dev/null'])
+    if not result.get('status'):
+        return command_failure(result, '监听端口获取失败')
+    if not result.get('result'):
+        return empty_result('未发现监听端口')
+
+    output = []
+    for line in result['result'].splitlines():
+        socket = parse_socket_line(line)
+        if not socket:
+            continue
+        output.append(
+            f'proto: {socket["proto"]}\tlocal: {socket["local"]}\tstate: {socket["state"] or "-"}'
+            f'\tprocess: {socket["process"] or "-"}\t[i] 监听端口'
+        )
+
+    return '\n'.join(output) or empty_result('未发现监听端口')
 
 
 @mcp.tool()
@@ -927,74 +956,69 @@ def check_hosts():
     return output or empty_result()
 
 
-check_bin_json = json.load(open(os.path.join(base_dir, 'config', 'info_bin.json'), encoding='utf-8'))
-
-
 @mcp.tool()
 def check_bin():
     """
-    校验 /usr/bin 基线。
+    采集 /usr/bin 关键文件线索。
     调用：怀疑系统命令被替换、权限异常或新增可疑命令时使用。
-    输出：返回权限/属主/链接/类型异常以及最近修改命令。
+    输出：返回近期修改、非 root 属主、异常权限和软链信息，供结合上下文复核。
     """
 
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
-    output = ''
-
     result = exec_command(ssh_session.client, 'ls -alt /usr/bin')
-    if result['status'] and result['result']:
-        current_bin = []
-        for file in get_file_list(result['result']).values():
-            filename = file['filename']
-            owner = file['owner']
-            group = file['group']
-            perm = file['perm']
-            time = file['time']
-            link = ''
-            current_bin.append([filename, time])
+    if not result['status']:
+        return command_failure(result, '/usr/bin 文件列表读取失败')
+    if not result['result']:
+        return empty_result()
 
-            if '->' in filename:
-                link = filename.split(' -> ')[1]
-                filename = filename.split(' -> ')[0]
+    files = list(get_file_list(result['result']).values())
+    recent_files = []
+    suspicious_files = []
+    symlink_files = []
 
-            check_out = []
-            if filename in check_bin_json:
-                baseline = check_bin_json[filename]
-                if baseline.get('perm') is None or baseline.get('owner') is None or baseline.get('group') is None:
-                    check_out.append('基线缺字段')
-                if baseline.get('perm') is not None and perm != baseline.get('perm'):
-                    check_out.append('权限异常')
-                if baseline.get('owner') is not None and baseline.get('group') is not None:
-                    if owner != baseline.get('owner') or group != baseline.get('group'):
-                        check_out.append('所属异常')
-                if baseline.get('link') is not None and link != baseline.get('link'):
-                    check_out.append('恶意链接')
-            else:
-                check_out.append("不常见命令")
+    for file in files:
+        filename = file['filename']
+        owner = file['owner']
+        group = file['group']
+        perm = file['perm']
+        time = file['time']
+        link = ''
 
-            if check_out:
-                output += f"file: {filename}\tperm: {perm}\towner: {owner}\tgroup: {group}\t[!] {', '.join(check_out)}\n"
+        if ' -> ' in filename:
+            filename, link = filename.split(' -> ', 1)
 
-        # '/usr/bin 最近修改'
-        output += ''.join(
-            [f'file: {item[0]}\ttime: {item[1]}\t[!] 最近修改的命令\n' for item in current_bin[:5]])
+        if len(recent_files) < 10:
+            recent_files.append(f'file: {filename}\ttime: {time}\t[i] /usr/bin 近期修改文件')
 
-    # 文件类型排查
-    result = exec_command(ssh_session.client, 'find /usr/bin -type f -exec file {} + 2>/dev/null')
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            if ':' in line:
-                file_path, file_type = line.split(':', 1)
-                file_type = file_type.split(',')[0].strip()
-                if 'ELF' in file_type:
-                    file_type = 'ELF'
-                if Path(file_path).name in check_bin_json:
-                    if check_bin_json[Path(file_path).name].get('type') != file_type:
-                        output += f'file path: {file_path}\tfile type: {file_type}\t[!] 文件类型错误\n'
+        reasons = []
+        if owner != 'root' or group != 'root':
+            reasons.append('非 root 属主/属组')
+        if len(perm) > 8 and perm[8] == 'w':
+            reasons.append('other 可写权限')
+        if len(perm) > 3 and perm[3] in {'s', 'S'}:
+            reasons.append('setuid 权限')
+        if len(perm) > 6 and perm[6] in {'s', 'S'}:
+            reasons.append('setgid 权限')
 
-    return output or empty_result()
+        if reasons:
+            suspicious_files.append(
+                f'file: {filename}\tperm: {perm}\towner: {owner}\tgroup: {group}\t[!] {", ".join(reasons)}，需结合上下文复核'
+            )
+        if link:
+            symlink_files.append(f'file: {filename}\tlink: {link}\t[i] /usr/bin 软链条目')
+
+    output = []
+    output.extend(recent_files)
+    output.extend(suspicious_files[:50])
+    if len(suspicious_files) > 50:
+        output.append(f'[i] 还有 {len(suspicious_files) - 50} 条权限/属主线索未展示')
+    output.extend(symlink_files[:30])
+    if len(symlink_files) > 30:
+        output.append(f'[i] 还有 {len(symlink_files) - 30} 条软链线索未展示')
+
+    return '\n'.join(output) or empty_result()
 
 
 @mcp.tool()
@@ -1022,6 +1046,41 @@ def check_tmp():
 
 
 @mcp.tool()
+def check_recent_files(path='/tmp', days=7, max_results=200):
+    """
+    检查指定目录近期变更文件。
+    调用：排查 /tmp、webroot 或用户目录中近期落地的脚本、样本和异常文件时使用。
+    输出：返回文件路径、属主、权限、大小和修改时间。
+    """
+    if not check_session():
+        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+
+    if not isinstance(path, str) or not path.strip() or not path.strip().startswith('/'):
+        return "path 必须是目标主机上的绝对路径"
+    try:
+        days = max(1, min(int(days), 365))
+    except (TypeError, ValueError):
+        days = 7
+    try:
+        max_results = max(1, min(int(max_results), 1000))
+    except (TypeError, ValueError):
+        max_results = 200
+
+    quoted_path = quote_remote_path(path.strip())
+    command = (
+        f"find {quoted_path} -type f -mtime -{days} "
+        f"-printf '%TY-%Tm-%Td %TH:%TM\t%u:%g\t%m\t%s bytes\t%p\\n' 2>/dev/null "
+        f"| head -n {max_results}"
+    )
+    result = exec_command(ssh_session.client, command, timeout=30, max_bytes=300000)
+    if not result['status']:
+        return command_failure(result, '近期文件扫描失败')
+    if not result['result']:
+        return empty_result(f'最近 {days} 天未发现变更文件')
+    return '\n'.join(f'{line}\t[i] 近期变更文件' for line in result['result'].splitlines())
+
+
+@mcp.tool()
 def check_webshell(path='/var/www/html', max_files=20000):
     """
     扫描 webroot 中的疑似 WebShell。
@@ -1040,17 +1099,27 @@ def check_webshell(path='/var/www/html', max_files=20000):
     path = path.strip() or '/var/www/html'
     quoted_path = quote_remote_path(path)
 
-    result = exec_command(ssh_session.client, f'find {quoted_path} -type f 2>/dev/null')
-    if not result['status']:
-        return command_failure(result, 'webroot 文件枚举失败')
-    if not result['result']:
+    count_result = first_success(
+        ssh_session.client,
+        [
+            f"find {quoted_path} -type f -printf '.\\n' 2>/dev/null | head -n {max_files + 1} | wc -l",
+            f"find {quoted_path} -type f 2>/dev/null | head -n {max_files + 1} | wc -l",
+        ],
+        timeout=30,
+        max_bytes=1000,
+    )
+    if not count_result['status']:
+        return command_failure(count_result, 'webroot 文件计数失败')
+    try:
+        file_count = int(count_result['result'].splitlines()[0].strip())
+    except (IndexError, ValueError):
+        return command_failure(count_result, 'webroot 文件计数失败')
+    if file_count == 0:
         return empty_result('webroot 目录未发现文件')
-
-    file_count = len(result['result'].splitlines())
     if file_count > max_files:
-        return f'webroot 文件数量 {file_count} 超过限制 {max_files}，请缩小扫描目录或提高 max_files'
+        return f'webroot 文件数量超过限制 {max_files}，请缩小扫描目录或提高 max_files'
 
-    if result['status'] and result['result']:
+    if file_count:
         size_result = exec_command(ssh_session.client, f"du -sb {quoted_path} 2>/dev/null | awk '{{print $1}}'", timeout=20, max_bytes=1000)
         if size_result['status'] and size_result['result']:
             try:
@@ -1386,11 +1455,7 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
     except (TypeError, ValueError):
         max_lines = 5000
 
-    output = f'仅分析最近 {max_lines} 行日志\n'
-    ssh_session.request_success = {}
-    ssh_session.request_jump = {}
-    ssh_session.request_others = {}
-    ssh_session.user_agents = []
+    output = [f'仅分析最近 {max_lines} 行日志']
 
     result = exec_command(ssh_session.client, f'tail -n {int(max_lines)} {quote_remote_path(path)} 2>/dev/null')
     if not result['status']:
@@ -1398,60 +1463,49 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
     if not result['result']:
         return empty_result('日志为空或无可读内容')
 
-    if result['status'] and result['result']:
-        access_log = result['result'].splitlines()
-        checked_lines = set()
-        for line in access_log:
-            stripped = line.strip()
-            if stripped in checked_lines:
-                continue
-            checked_lines.add(stripped)
-            malicious = detect_malicious_text(stripped)
-            if malicious:
-                output += f'url: {urllib.parse.unquote(stripped)}\t[!] 恶意请求\n'
+    checked_lines = set()
+    for line in result['result'].splitlines():
+        stripped = line.strip()
+        if stripped in checked_lines:
+            continue
+        checked_lines.add(stripped)
+        if detect_malicious_text(stripped, use_safeline=False):
+            output.append(f'url: {urllib.parse.unquote(stripped)}\t[!] 恶意请求')
 
-        for num, match in enumerate(pattern.finditer(result['result'])):
-            request = match.groupdict()
-            status = request['status']
-            user_agent = request['user_agent']
+    request_success = []
+    request_jump = []
+    request_others = []
+    user_agents = set()
+    for match in pattern.finditer(result['result']):
+        request = match.groupdict()
+        status = request['status']
+        user_agents.add(request['user_agent'])
+        if status == '200' and len(request['path']) != 1:
+            request_success.append(request)
+        elif status == '302':
+            request_jump.append(request)
+        else:
+            request_others.append(request)
 
-            if status == '200' and len(request['path']) != 1:
-                ssh_session.request_success[num] = request
-            elif status == '302':
-                ssh_session.request_jump[num] = request
-            else:
-                ssh_session.request_others[num] = request
+    output.append('成功访问 IP 统计')
+    output.extend(f'\tip: {ip}\tcount: {count}' for ip, count in collections.Counter(request['ip'] for request in request_success).items())
 
-            if user_agent not in ssh_session.user_agents:
-                ssh_session.user_agents.append(user_agent)
+    output.append('\n跳转访问 IP 统计')
+    output.extend(f'\tip: {ip}\tcount: {count}' for ip, count in collections.Counter(request['ip'] for request in request_jump).items())
 
-        output += '成功访问 IP 统计\n'
-        for ip, count in collections.Counter(
-                [request['ip'] for request in ssh_session.request_success.values()]).items():
-            output += f'\tip: {ip}\tcount: {count}\n'
+    output.append('\n失败访问 IP 统计')
+    output.extend(f'\tip: {ip}\tcount: {count}' for ip, count in collections.Counter(request['ip'] for request in request_others).items())
 
-        output += '\n跳转访问 IP 统计\n'
-        for ip, count in collections.Counter([request['ip'] for request in ssh_session.request_jump.values()]).items():
-            output += f'\tip: {ip}\tcount: {count}\n'
+    output.append('\n访问 User-Agent 统计')
+    output.extend(f'\tUser-Agent: {user_agent}' for user_agent in sorted(user_agents))
 
-        output += '\n失败访问 IP 统计\n'
-        for ip, count in collections.Counter(
-                [request['ip'] for request in ssh_session.request_others.values()]).items():
-            output += f'\tip: {ip}\tcount: {count}\n'
+    output.append('\n成功访问 请求统计')
+    output.extend(f'\tip: {request["ip"]}\turi: {request["path"]}\tuser agent: {request["user_agent"]}' for request in request_success)
 
-        output += '\n访问 User-Agent 统计\n'
-        for user_agent in sorted(ssh_session.user_agents):
-            output += f'\tUser-Agent: {user_agent}\n'
+    output.append('\n跳转访问 请求统计')
+    output.extend(f'\tip: {request["ip"]}\turi: {request["path"]}\tuser agent: {request["user_agent"]}' for request in request_jump)
 
-        output += '\n成功访问 请求统计\n'
-        for request in ssh_session.request_success.values():
-            output += f'\tip: {request["ip"]}\turi: {request["path"]}\tuser agent: {request["user_agent"]}\n'
-
-        output += '\n跳转访问 请求统计\n'
-        for request in ssh_session.request_jump.values():
-            output += f'\tip: {request["ip"]}\turi: {request["path"]}\tuser agent: {request["user_agent"]}\n'
-
-    return output
+    return '\n'.join(output)
 
 
 @mcp.tool()
@@ -1505,22 +1559,33 @@ def check_login_fail():
 
 
 @mcp.tool()
-def RookitUpload():
+def RookitUpload(install=False):
     """
-    上传并安装 rkhunter。
-    调用：需要 rootkit 深度检测时使用；安装后需用户手动执行 rkhunter --check。
-    输出：返回上传安装状态。
+    上传 rkhunter；默认不安装。
+    调用：需要 rootkit 深度检测时使用；只有明确 install=True 时才会在目标机执行安装脚本。
+    输出：返回上传状态、人工安装命令或显式安装结果。
     """
 
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 
     local_rkhunter = Path(base_dir) / 'extensions' / 'rkhunter.gz'
-    upload_result = sftp_upload(ssh_session.client, str(local_rkhunter), '/tmp/rkhunter.gz')
+    remote_archive = f'/tmp/autoir_rkhunter_{get_time_path()}.tar.gz'
+    quoted_archive = quote_remote_path(remote_archive)
+    upload_result = sftp_upload(ssh_session.client, str(local_rkhunter), remote_archive)
     if not upload_result.get('status'):
         return f'上传失败: {upload_result.get("error") or "本地 rkhunter.gz 不存在或 SFTP 失败"}'
 
-    result = exec_command(ssh_session.client, 'cd /tmp && tar -xf /tmp/rkhunter.gz && cd /tmp/rkhunter-1.4.6 && bash installer.sh --install', timeout=120, max_bytes=120000)
+    install_command = f'cd /tmp && tar -xf {quoted_archive} && cd /tmp/rkhunter-1.4.6 && bash installer.sh --install'
+    if not install:
+        return {
+            "status": True,
+            "result": "rkhunter 已上传，默认未安装；如需修改目标系统，请人工确认后执行安装命令或调用 install=True",
+            "remote_archive": remote_archive,
+            "manual_install_command": install_command,
+        }
+
+    result = exec_command(ssh_session.client, install_command, timeout=120, max_bytes=120000)
 
     if result['status'] and result['result']:
         if "complete" in result['result'].lower():
@@ -1767,6 +1832,11 @@ def safe_local_subdir(relative_dir):
     return target
 
 
+def is_allowed_upload_source(path):
+    allowed_roots = (Path(base_dir) / 'extensions', Path(base_dir) / 'downloads')
+    return any(is_safe_path(root, path) for root in allowed_roots)
+
+
 @mcp.tool()
 def stat_file(path):
     """
@@ -1809,24 +1879,38 @@ def hash_file(path, algorithm='sha256'):
 
 
 @mcp.tool()
-def download_file(remote_path, local_dir='downloads/evidence'):
+def download_file(remote_path, local_dir='downloads/evidence', max_bytes=100 * 1024 * 1024):
     """
     下载目标主机文件到本地取证目录。
-    调用：需要保存可疑文件、日志或配置用于后续分析时使用。
+    调用：需要保存可疑文件、日志或配置用于后续分析时使用；默认拒绝超过 max_bytes 的文件。
     输出：返回本地路径、远程路径和下载状态。
     """
     if not check_session():
         return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
     if not isinstance(remote_path, str) or not remote_path.strip():
         return {"status": False, "result": "remote_path 不能为空"}
-    stat_result = exec_command(ssh_session.client, f"stat -c '%n\t%s bytes\t%U:%G\t%A\t%y' {quote_remote_path(remote_path)} 2>/dev/null")
+    try:
+        max_bytes = max(1024, min(int(max_bytes), 2 * 1024 * 1024 * 1024))
+    except (TypeError, ValueError):
+        max_bytes = 100 * 1024 * 1024
+    remote_path = remote_path.strip()
+    quoted_remote = quote_remote_path(remote_path)
+    stat_result = exec_command(ssh_session.client, f"stat -c '%s\t%n\t%s bytes\t%U:%G\t%A\t%y' {quoted_remote} 2>/dev/null", timeout=10, max_bytes=4000)
+    if not stat_result.get('status'):
+        return {"status": False, "remote_path": remote_path, "result": command_failure(stat_result, '远程文件元数据读取失败')}
+    try:
+        remote_size = int(stat_result.get('result', '').split('\t', 1)[0])
+    except (IndexError, ValueError):
+        return {"status": False, "remote_path": remote_path, "result": "远程文件大小解析失败"}
+    if remote_size > max_bytes:
+        return {"status": False, "remote_path": remote_path, "size": remote_size, "max_bytes": max_bytes, "result": "远程文件超过下载大小限制"}
     target_dir = safe_local_subdir(local_dir) / get_time_path()
     target_dir.mkdir(parents=True, exist_ok=True)
-    local_path = target_dir / Path(remote_path.strip()).name
-    result = sftp_download(ssh_session.client, remote_path.strip(), str(local_path))
+    local_path = target_dir / Path(remote_path).name
+    result = sftp_download(ssh_session.client, remote_path, str(local_path))
     return {
         "status": result.get('status'),
-        "remote_path": remote_path.strip(),
+        "remote_path": remote_path,
         "local_path": str(local_path) if result.get('status') else "",
         "stat": stat_result.get('result', ''),
         "error": result.get('error', ''),
@@ -1845,6 +1929,8 @@ def upload_file(local_path, remote_path):
     local = Path(local_path).expanduser().resolve()
     if not local.is_file():
         return {"status": False, "result": f"本地文件不存在: {local}"}
+    if not is_allowed_upload_source(local):
+        return {"status": False, "result": "local_path 仅允许位于项目 extensions/ 或 downloads/ 目录内"}
     if not isinstance(remote_path, str) or not remote_path.strip():
         return {"status": False, "result": "remote_path 不能为空"}
     result = sftp_upload(ssh_session.client, str(local), remote_path.strip())
@@ -1992,12 +2078,16 @@ def check_container_mounts():
     ids = container_ids(runtime)
     if not ids:
         return empty_result('未发现容器')
-    output = []
-    for cid in ids[:50]:
-        result = exec_command(ssh_session.client, f"{runtime} inspect --format '{{{{.Name}}}} {{{{json .Mounts}}}}' {shlex.quote(cid)} 2>/dev/null", timeout=20, max_bytes=50000)
-        if result['status'] and result['result']:
-            output.append(result['result'])
-    return '\n'.join(output) or empty_result('未发现容器挂载信息')
+    quoted_ids = ' '.join(shlex.quote(cid) for cid in ids[:50])
+    result = exec_command(
+        ssh_session.client,
+        f"{runtime} inspect --format '{{{{.Name}}}} {{{{json .Mounts}}}}' {quoted_ids} 2>/dev/null",
+        timeout=30,
+        max_bytes=500000,
+    )
+    if result['status'] and result['result']:
+        return result['result']
+    return empty_result('未发现容器挂载信息')
 
 
 @mcp.tool()
@@ -2015,12 +2105,12 @@ def check_container_processes():
     ids = container_ids(runtime)
     if not ids:
         return empty_result('未发现容器')
-    output = []
-    for cid in ids[:50]:
-        result = exec_command(ssh_session.client, f"{runtime} top {shlex.quote(cid)} 2>/dev/null", timeout=20, max_bytes=50000)
-        if result['status'] and result['result']:
-            output.append(f'## {cid}\n{result["result"]}')
-    return '\n\n'.join(output) or empty_result('未发现容器进程信息')
+    quoted_ids = ' '.join(shlex.quote(cid) for cid in ids[:50])
+    command = f'for cid in {quoted_ids}; do echo "## $cid"; {runtime} top "$cid" 2>/dev/null; done'
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=500000)
+    if result['status'] and result['result']:
+        return result['result']
+    return empty_result('未发现容器进程信息')
 
 
 @mcp.tool()
@@ -2032,21 +2122,12 @@ def check_user_crontabs():
     """
     if not check_session():
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
-    passwd = exec_command(ssh_session.client, 'cat /etc/passwd 2>/dev/null')
-    if not passwd['status']:
-        return command_failure(passwd, 'passwd 读取失败')
-    users = []
-    for line in passwd['result'].splitlines():
-        parts = line.split(':')
-        if len(parts) >= 7 and parts[6] not in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false'):
-            users.append(parts[0])
+    command = """awk -F: '$7 !~ /(nologin|false)$/ {print $1}' /etc/passwd 2>/dev/null | head -n 200 | while IFS= read -r user; do crontab=$(crontab -l -u "$user" 2>/dev/null); if [ -n "$crontab" ]; then printf '## user: %s\n%s\n\n' "$user" "$crontab"; fi; done"""
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=300000)
     output = []
-    for user in users[:200]:
-        quoted_user = shlex.quote(user)
-        result = exec_command(ssh_session.client, f'crontab -l -u {quoted_user} 2>/dev/null', timeout=10, max_bytes=50000)
-        if result['status'] and result['result']:
-            output.append(f'## user: {user}\n{result["result"]}')
-    spool = exec_command(ssh_session.client, 'find /var/spool/cron /var/spool/cron/crontabs -type f -maxdepth 2 -printf "%p\t%u:%g\t%m\t%s bytes\n" 2>/dev/null', timeout=20)
+    if result['status'] and result['result']:
+        output.append(result['result'])
+    spool = exec_command(ssh_session.client, 'find /var/spool/cron /var/spool/cron/crontabs -maxdepth 2 -type f -printf "%p\t%u:%g\t%m\t%s bytes\n" 2>/dev/null', timeout=20)
     if spool['status'] and spool['result']:
         output.append('## cron spool files\n' + spool['result'])
     return '\n\n'.join(output) or empty_result('未发现用户级 crontab')
@@ -2076,6 +2157,49 @@ def check_at_jobs():
     return '\n\n'.join(output)
 
 
+def quick_persistence_tools():
+    return (
+        check_ld_so_preload,
+        check_env_preload,
+        check_alias,
+        check_cron,
+        check_user_crontabs,
+        check_at_jobs,
+        check_startup,
+    )
+
+
+def full_persistence_extra_tools():
+    return (
+        check_ssh,
+        check_ssh_wrapper,
+        check_inetd,
+        check_xinetd,
+        check_setuid,
+        check_profile,
+        check_rc,
+        check_fstab,
+        check_systemd_timers,
+        check_service_execstart,
+    )
+
+
+def persistence_tools():
+    return quick_persistence_tools() + (check_ssh_keys,) + full_persistence_extra_tools()
+
+
+@mcp.tool()
+def check_persistence_summary():
+    """
+    汇总持久化检测结果。
+    调用：需要一次性查看 cron、systemd、启动项、shell 初始化、SSH key 等持久化线索时使用。
+    输出：返回各持久化检测工具的摘要。
+    """
+    if not check_session():
+        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+    return run_tool_sequence(persistence_tools())
+
+
 @mcp.tool()
 def get_triage_summary():
     """
@@ -2097,6 +2221,7 @@ def run_tool_sequence(tools):
             text = format_tool_output(tool_name, value)
             if not isinstance(text, str):
                 text = json.dumps(text, ensure_ascii=False)
+            text, _ = truncate_text(text, max_chars=60000)
             results.append(f'## {tool_name}\n{text}')
         except Exception as error:
             results.append(f'## {tool_name}\n[ERROR] {error}')
@@ -2116,8 +2241,7 @@ def run_quick_triage():
         check_safeline, get_system_info, check_hijack, check_home, check_passwd, check_shadow,
         check_sudoers, check_ssh_keys, check_history, get_ps, check_mine, check_exec,
         check_deleted_exe, get_localhost, check_network, check_hosts, check_dns_config,
-        check_ld_so_preload, check_env_preload, check_alias, check_cron, check_user_crontabs,
-        check_at_jobs, check_startup, list_services, check_enabled_services, check_docker_containers,
+        *quick_persistence_tools(), list_services, check_enabled_services, check_docker_containers,
         check_login_success, check_login_fail,
     )
     result = run_tool_sequence(tools)
@@ -2137,9 +2261,8 @@ def run_full_triage(webroot='/var/www/html', include_webshell=True, include_root
         return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
     output = [run_quick_triage()]
     extra_tools = (
-        check_pid, check_exe, check_mount, check_eth, check_bin, check_tmp, check_ssh,
-        check_ssh_wrapper, check_inetd, check_xinetd, check_setuid, check_profile, check_rc,
-        check_fstab, check_systemd_timers, check_service_execstart, check_recent_systemd_changes,
+        check_pid, check_exe, check_mount, check_eth, check_bin, check_tmp,
+        *full_persistence_extra_tools(), check_recent_systemd_changes,
         check_container_mounts, check_container_processes, check_auth_log, check_web_logs_auto,
     )
     output.append(run_tool_sequence(extra_tools))
