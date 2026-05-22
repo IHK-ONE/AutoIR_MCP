@@ -170,9 +170,13 @@ def valid_port(value):
     return 1 <= port <= 65535
 
 
-def extract_ioc_values(text):
+def extract_ioc_values(text, limit=100):
     text = text or ''
-    urls = unique_limited(URL_PATTERN.findall(text), 100)
+    try:
+        limit = max(1, min(int(limit), 5000))
+    except (TypeError, ValueError):
+        limit = 100
+    urls = unique_limited(URL_PATTERN.findall(text), limit)
     url_hosts = []
     for url in urls:
         try:
@@ -182,29 +186,38 @@ def extract_ioc_values(text):
         except ValueError:
             pass
     ips = unique_limited(
-        ip for ip in IPV4_PATTERN.findall(text)
-        if not ip.startswith('127.') and ip not in {'0.0.0.0', '255.255.255.255'}
+        (
+            ip for ip in IPV4_PATTERN.findall(text)
+            if not ip.startswith('127.') and ip not in {'0.0.0.0', '255.255.255.255'}
+        ),
+        limit,
     )
     domains = unique_limited(
-        domain.lower() for domain in DOMAIN_PATTERN.findall(text)
-        if domain.lower() not in {'localhost'}
-        and not IPV4_PATTERN.fullmatch(domain)
-        and domain.rsplit('.', 1)[-1].lower() not in NOISE_DOMAIN_SUFFIXES
+        (
+            domain.lower() for domain in DOMAIN_PATTERN.findall(text)
+            if domain.lower() not in {'localhost'}
+            and not IPV4_PATTERN.fullmatch(domain)
+            and domain.rsplit('.', 1)[-1].lower() not in NOISE_DOMAIN_SUFFIXES
+        ),
+        limit,
     )
     path_text = URL_PATTERN.sub(' ', text)
     paths = unique_limited(
-        path for path in PATH_PATTERN.findall(path_text)
-        if not path.startswith('//') and not path.startswith('/dev/null')
+        (
+            path for path in PATH_PATTERN.findall(path_text)
+            if not path.startswith('//') and not path.startswith('/dev/null')
+        ),
+        limit,
     )
     ports = []
     for pattern in PORT_PATTERNS:
         ports.extend(match for match in pattern.findall(text) if valid_port(match))
     return {
         'ips': ips,
-        'domains': unique_limited(url_hosts + domains, 100),
+        'domains': unique_limited(url_hosts + domains, limit),
         'urls': urls,
         'paths': paths,
-        'ports': unique_limited(ports, 100),
+        'ports': unique_limited(ports, limit),
     }
 
 
@@ -278,21 +291,32 @@ def collect_attack_evidence(text, rules, limit=3):
     return evidence
 
 
-def infer_attack_flow(text, iocs=None, timeline_events=None, max_items=8):
+def infer_attack_flow(text, iocs=None, timeline_events=None, max_items=8, evidence_limit=3, include_unobserved=True):
     text = text or ''
+    try:
+        max_items = max(1, min(int(max_items), len(ATTACK_FLOW_RULES)))
+    except (TypeError, ValueError):
+        max_items = 8
+    try:
+        evidence_limit = max(1, min(int(evidence_limit), 10))
+    except (TypeError, ValueError):
+        evidence_limit = 3
+
     iocs = iocs or extract_ioc_values(text)
-    timeline_events = timeline_events or extract_timeline_events(text, limit=20)
+    if timeline_events is None:
+        timeline_events = extract_timeline_events(text, limit=20)
     rules = ATTACK_FLOW_RULES[:max_items]
-    evidence_by_stage = collect_attack_evidence(text, rules)
+    evidence_by_stage = collect_attack_evidence(text, rules, limit=evidence_limit)
     stages = []
     for stage, _ in rules:
-        evidence = evidence_by_stage.get(stage, [])
+        evidence = list(evidence_by_stage.get(stage, []))
         if stage == '命令控制/外联' and any(iocs.get(key) for key in ('ips', 'domains', 'urls', 'ports')):
             ioc_summary = ', '.join((iocs.get('ips') or [])[:3] + (iocs.get('domains') or [])[:3] + (iocs.get('urls') or [])[:2])
             if ioc_summary:
                 evidence.insert(0, f'IOC: {ioc_summary}')
         status = '发现线索' if evidence else '未发现明显线索'
-        stages.append({'stage': stage, 'status': status, 'evidence': evidence[:3]})
+        if include_unobserved or evidence:
+            stages.append({'stage': stage, 'status': status, 'evidence': evidence[:evidence_limit]})
 
     observed = [stage for stage in stages if stage['status'] == '发现线索']
     if observed:

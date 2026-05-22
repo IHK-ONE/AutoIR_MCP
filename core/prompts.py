@@ -6,6 +6,7 @@ TOOL_WORKFLOW = [
     "get_triage_summary",
     "extract_iocs",
     "generate_timeline",
+    "analyze_attack_chain",
     "generate_report",
     "按发现补充专项工具或 run_full_triage",
 ]
@@ -13,19 +14,19 @@ TOOL_WORKFLOW = [
 IR_PLAYBOOKS = {
     "quick_linux_ir": [
         "get_ssh_client", "check_safeline", "get_system_info", "run_quick_triage",
-        "get_triage_summary", "extract_iocs", "generate_timeline", "generate_report",
+        "get_triage_summary", "extract_iocs", "generate_timeline", "analyze_attack_chain", "generate_report",
     ],
     "web_intrusion_ir": [
         "get_ssh_client", "check_safeline", "get_system_info", "discover_webroots",
-        "check_web_logs_auto", "check_webshell", "check_recent_files", "extract_iocs", "generate_timeline", "generate_report",
+        "check_web_logs_auto", "check_webshell", "check_recent_files", "extract_iocs", "generate_timeline", "analyze_attack_chain", "generate_report",
     ],
     "persistence_ir": [
         "get_ssh_client", "check_safeline", "get_system_info", "check_persistence_summary",
-        "check_ssh_keys", "check_recent_systemd_changes", "extract_iocs", "generate_timeline", "generate_report",
+        "check_ssh_keys", "check_recent_systemd_changes", "extract_iocs", "generate_timeline", "analyze_attack_chain", "generate_report",
     ],
     "account_ir": [
         "get_ssh_client", "get_system_info", "check_passwd", "check_shadow", "check_sudoers",
-        "check_home", "check_history", "check_ssh_keys", "check_login_success", "check_login_fail", "generate_report",
+        "check_home", "check_history", "check_ssh_keys", "check_login_success", "check_login_fail", "extract_iocs", "generate_timeline", "analyze_attack_chain", "generate_report",
     ],
 }
 
@@ -33,7 +34,7 @@ TOOL_CATEGORIES = {
     "基础/会话": [
         "get_ssh_client", "check_ssh_session", "close_ssh_client", "reset_session",
         "shell", "check_safeline", "get_system_info", "get_tool_inventory", "get_ir_playbooks",
-        "run_quick_triage", "run_full_triage", "get_triage_summary", "generate_report", "extract_iocs", "generate_timeline",
+        "run_quick_triage", "run_full_triage", "get_triage_summary", "extract_iocs", "generate_timeline", "analyze_attack_chain", "generate_report",
     ],
     "取证文件": [
         "stat_file", "hash_file", "profile_suspicious_file", "download_file", "upload_file", "collect_evidence_bundle",
@@ -96,7 +97,8 @@ MCP_INSTRUCTIONS = f"""
 
 工作原则：
 - 先建立上下文，再做判断；证据不足时标注“需人工复核”，不要把线索写成结论。
-- 按需调用工具，避免重复扫描；已有 quick/full triage 结果时优先调用 get_triage_summary。
+- 按需调用工具，避免重复扫描；已有 quick/full triage 结果时优先调用 get_triage_summary、extract_iocs、generate_timeline、analyze_attack_chain、generate_report。
+- 直接检测工具保持简洁，综合分析工具负责组织 IOC、时间线、攻击链、报告和下一步建议。
 - 工具失败、权限不足、WAF 不可用、输出截断必须明示，不能归类为无异常。
 
 推荐流程：
@@ -116,9 +118,10 @@ MCP_INSTRUCTIONS = f"""
 最终报告要求：
 - 必须以如下 AUTOIR_MCP 艺术字开头，放在 text 代码块中：
 {AUTOIR_MCP_BANNER}
-- 结构固定为：摘要 → 检测结果表 → IOC 摘要 → 攻击流程分析 → 风险分析 → 处置建议 → 后续建议。
+- 结构固定为：摘要 → 检测结果表 → IOC 摘要 → 时间线摘要 → 攻击流程分析 → 风险分析 → 处置建议 → 后续建议。
 - 检测结果表字段固定为：| 检测项 | 关键发现 | 风险 | 依据 |。
 - 攻击流程分析必须基于工具输出、IOC 和时间线线索；证据不足时标注“需人工复核”，不得编造完整攻击链。
+- generate_report 可用 report_profile=standard/executive/technical/handoff 和 focus 指定报告画像与关注方向。
 - 风险等级只能使用：高 / 中 / 低 / 信息 / 未发现明显异常。
 - 明确区分“未发现明显异常”“检测失败”“权限不足”“输出截断”“需人工复核”。
 """.strip()

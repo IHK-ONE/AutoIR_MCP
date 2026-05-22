@@ -33,19 +33,20 @@ python AutoIR_MCP.py
 2. `check_safeline`、`get_system_info`：建立检测上下文。
 3. `run_quick_triage`：快速巡检。
 4. `get_triage_summary`：复用最近巡检缓存。
-5. `extract_iocs`：汇总 IOC。
+5. `extract_iocs`：汇总 IOC，支持 `limit` 控制每类数量。
 6. `generate_timeline`：从巡检缓存或文本中提取事件时间线。
-7. `generate_report`：生成规范化报告草稿。
-8. 根据发现继续调用专项工具，或使用 `run_full_triage`。
+7. `analyze_attack_chain`：基于证据生成攻击阶段表和攻击路径判断。
+8. `generate_report`：生成规范化报告草稿，支持报告画像和输出范围参数。
+9. 根据发现继续调用专项工具，或使用 `run_full_triage`。
 
 ## 工具执行链模板
 
 `get_ir_playbooks` 会返回常用模板，只提供建议流程，不自动执行：
 
-- `quick_linux_ir`：基础连接、SafeLine、系统信息、快速巡检、IOC、时间线、报告。
-- `web_intrusion_ir`：Webroot 发现、Web 日志、WebShell、近期文件、IOC、时间线、报告。
-- `persistence_ir`：cron、systemd、启动项、shell 初始化、SSH key、持久化摘要、时间线。
-- `account_ir`：账户、sudoers、history、SSH key、登录成功/失败统计。
+- `quick_linux_ir`：基础连接、SafeLine、系统信息、快速巡检、IOC、时间线、攻击链、报告。
+- `web_intrusion_ir`：Webroot 发现、Web 日志、WebShell、近期文件、IOC、时间线、攻击链、报告。
+- `persistence_ir`：cron、systemd、启动项、shell 初始化、SSH key、持久化摘要、时间线、攻击链、报告。
+- `account_ir`：账户、sudoers、history、SSH key、登录成功/失败统计、IOC、时间线、攻击链、报告。
 
 ## 功能清单
 
@@ -63,9 +64,10 @@ python AutoIR_MCP.py
 - `run_quick_triage`：快速巡检用户、进程、网络、持久化和登录日志。
 - `run_full_triage`：全量巡检，支持 WebShell 和 Rootkit 相关步骤。
 - `get_triage_summary`：读取最近一次巡检缓存。
-- `extract_iocs`：从文本或最近巡检缓存提取 IP、域名、URL、路径和端口。
+- `extract_iocs`：从文本或最近巡检缓存提取 IP、域名、URL、路径和端口，支持 `limit` 控制每类数量。
 - `generate_timeline`：从文本或最近巡检缓存提取事件时间线。
-- `generate_report`：基于巡检缓存生成规范化报告草稿。
+- `analyze_attack_chain`：从文本或巡检缓存生成攻击阶段表、攻击路径判断、IOC 和时间线数据，支持控制阶段数、证据条数和 IOC 展示数量。
+- `generate_report`：基于巡检缓存生成规范化报告草稿，支持 `report_profile`、`focus`、`max_findings`、`max_timeline_events`、`max_iocs_per_type` 等参数。
 
 ### 文件、取证与 WebShell
 
@@ -172,9 +174,16 @@ python AutoIR_MCP.py
 
 ## 统一报告输出
 
-最终报告必须以 `AUTOIR_MCP` 艺术字开头，并使用固定结构：摘要 → 检测结果表 → IOC 摘要 → 攻击流程分析 → 风险分析 → 处置建议 → 后续建议。
+最终报告必须以 `AUTOIR_MCP` 艺术字开头，并使用固定结构：摘要 → 检测结果表 → IOC 摘要 → 时间线摘要 → 攻击流程分析 → 风险分析 → 处置建议 → 后续建议。
 
-`generate_report` 会基于巡检缓存、IOC 和时间线线索生成攻击流程分析。该分析只做证据化阶段判断，证据不足时必须标注需人工复核，不编造完整攻击链。
+`analyze_attack_chain` 会基于巡检缓存、IOC 和时间线线索生成攻击阶段表。`generate_report` 会复用这些结果生成面向 AI 客户端的报告草稿。分析只做证据化阶段判断，证据不足时必须标注需人工复核，不编造完整攻击链。
+
+常用报告参数：
+
+- `report_profile`：`standard`、`executive`、`technical`、`handoff`。
+- `focus`：声明关注方向，例如 Web、账户、持久化、挖矿。
+- `max_findings`、`max_timeline_events`、`max_iocs_per_type`、`evidence_limit`：控制输出密度。
+- `include_iocs=false`：仅关闭 IOC 摘要；证据、时间线和攻击链章节仍会保留原始工具输出。
 
 检测结果表固定字段：
 

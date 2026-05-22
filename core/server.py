@@ -35,6 +35,7 @@ import urllib.parse
 from pathlib import Path
 
 base_dir = str(PROJECT_ROOT)
+INTERNAL_IOC_LIMIT = 5000
 
 mcp = FastMCP("AutoIR_MCP", instructions=MCP_INSTRUCTIONS)
 
@@ -228,7 +229,28 @@ def ioc_source_text(text='', include_last_triage=True):
     return '\n'.join(values)
 
 
-def format_ioc_lines(iocs):
+def clamp_int(value, default, minimum=1, maximum=500):
+    try:
+        return max(minimum, min(int(value), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+def trim_iocs(iocs, limit):
+    limit = clamp_int(limit, 50, minimum=1, maximum=500)
+    return {key: (values or [])[:limit] for key, values in (iocs or {}).items()}
+
+
+def iocs_truncated(iocs, limit, extraction_limit=None):
+    limit = clamp_int(limit, 50, minimum=1, maximum=500)
+    extraction_limit = clamp_int(extraction_limit, 0, minimum=0, maximum=INTERNAL_IOC_LIMIT) if extraction_limit else None
+    return any(
+        len(values or []) > limit or (extraction_limit and len(values or []) >= extraction_limit)
+        for values in (iocs or {}).values()
+    )
+
+
+def format_ioc_lines(iocs, limit=50, extraction_limit=None):
     lines = []
     labels = {
         'ips': 'IP',
@@ -237,10 +259,90 @@ def format_ioc_lines(iocs):
         'paths': '路径',
         'ports': '端口',
     }
+    limit = clamp_int(limit, 50, minimum=1, maximum=500)
+    extraction_limit = clamp_int(extraction_limit, 0, minimum=0, maximum=INTERNAL_IOC_LIMIT) if extraction_limit else None
     for key, label in labels.items():
-        values = iocs.get(key) or []
-        lines.append(f'- {label}: {", ".join(values) if values else "未提取到"}')
+        all_values = iocs.get(key) or []
+        values = all_values[:limit]
+        hidden = len(all_values) - limit
+        if hidden > 0 and extraction_limit and len(all_values) >= extraction_limit:
+            suffix = f'（另有 {hidden} 条已提取未展示；提取达到上限，实际数量可能更多）'
+        elif hidden > 0:
+            suffix = f'（另有 {hidden} 条未展示）'
+        else:
+            suffix = ''
+        lines.append(f'- {label}: {", ".join(values) + suffix if values else "未提取到"}')
     return '\n'.join(lines)
+
+
+def format_timeline_lines(events, limit=10):
+    if not events:
+        return '未提取到常见时间格式的事件线索'
+    limit = clamp_int(limit, 10, minimum=1, maximum=100)
+    rows = ['| 时间 | 事件 | 来源 |', '|---|---|---|']
+    for item in events[:limit]:
+        event = item['event'].replace('|', '/')
+        source_name = item['source'].replace('|', '/')
+        rows.append(f'| {item["time"]} | {event} | {source_name} |')
+    if len(events) > limit:
+        rows.append(f'| ... | 另有 {len(events) - limit} 条时间线线索未展示 | ... |')
+    return '\n'.join(rows)
+
+
+def suggest_next_tools(focus, attack_flow, iocs):
+    suggestions = []
+    seen = set()
+
+    def add(tool, reason):
+        if tool not in seen:
+            seen.add(tool)
+            suggestions.append((tool, reason))
+
+    focus_text = str(focus or '').lower()
+    if any(keyword in focus_text for keyword in ('web', 'webshell', '站点', '网站')):
+        add('discover_webroots', '确认站点目录')
+        add('check_web_logs_auto', '补充 Web 访问证据')
+        add('check_webshell', '扫描站点落地文件')
+    if any(keyword in focus_text for keyword in ('account', 'ssh', '账户', '登录')):
+        add('check_auth_log', '复核认证日志')
+        add('check_ssh_keys', '排查 SSH 免密入口')
+    if any(keyword in focus_text for keyword in ('persistence', 'backdoor', '持久化', '后门')):
+        add('check_persistence_summary', '汇总持久化线索')
+        add('check_recent_systemd_changes', '复核近期 systemd 变更')
+
+    for stage in attack_flow.get('stages', []):
+        if stage.get('status') != '发现线索':
+            continue
+        name = stage.get('stage', '')
+        if name == '初始访问':
+            add('check_auth_log', '还原登录、爆破或 Web 入口')
+            add('check_web_logs_auto', '补充 Web 初始访问日志')
+        elif name == '执行与落地':
+            add('check_recent_files', '定位近期落地文件')
+            add('profile_suspicious_file', '画像可疑文件')
+        elif name == '权限提升':
+            add('check_sudoers', '复核高权限账户和组')
+            add('check_setuid', '复核 SUID 提权面')
+        elif name == '持久化':
+            add('check_persistence_summary', '展开 cron、systemd、SSH key 和 shell 初始化检查')
+        elif name == '防御规避':
+            add('check_deleted_exe', '排查已删除仍运行进程')
+            add('check_pid', '排查隐藏 PID')
+        elif name == '命令控制/外联':
+            add('check_network', '复核外联连接')
+            add('check_dns_config', '复核 DNS/hosts 劫持')
+        elif name == '影响动作':
+            add('check_mine', '复核挖矿或资源异常')
+            add('check_container_processes', '复核容器内异常进程')
+
+    if iocs.get('paths'):
+        add('profile_suspicious_file', '对 IOC 路径做文件画像')
+    if iocs.get('ips') or iocs.get('domains') or iocs.get('urls'):
+        add('extract_iocs', '复核 IOC 去重结果并用于封禁/溯源')
+    if not suggestions:
+        add('run_full_triage', '材料不足时扩大巡检范围')
+        add('collect_evidence_bundle', '固化关键证据用于离线复盘')
+    return '\n'.join(f'- `{tool}`：{reason}' for tool, reason in suggestions[:8])
 
 
 def summarize_triage_sections(content, max_sections=12):
@@ -271,23 +373,26 @@ def summarize_triage_sections(content, max_sections=12):
 
 
 @mcp.tool()
-def extract_iocs(text='', include_last_triage=True):
+def extract_iocs(text='', include_last_triage=True, limit=100):
     """
     从输入文本或最近一次巡检缓存提取 IOC。
     调用：需要从日志、进程、WebShell、巡检摘要中汇总 IP、域名、URL、路径和端口时使用。
-    输出：返回去重后的 IOC 字段，不做外部情报查询。
+    输出：返回去重后的 IOC 字段，不做外部情报查询；limit 控制每类 IOC 最大数量。
     """
     source = ioc_source_text(text, include_last_triage)
     if not source.strip():
         return {"status": False, "result": "没有可提取 IOC 的文本；请传入 text 或先运行 run_quick_triage/run_full_triage"}
-    iocs = extract_ioc_values(source)
-    result = format_ioc_lines(iocs)
+    limit = clamp_int(limit, 100, minimum=1, maximum=500)
+    iocs = extract_ioc_values(source, limit=INTERNAL_IOC_LIMIT)
+    visible_iocs = trim_iocs(iocs, limit)
+    truncated = iocs_truncated(iocs, limit, extraction_limit=INTERNAL_IOC_LIMIT)
+    result = format_ioc_lines(iocs, limit=limit, extraction_limit=INTERNAL_IOC_LIMIT)
     return {
         "status": True,
         "result": result,
-        "iocs": iocs,
-        "data": {"iocs": iocs},
-        "meta": {"tool": "extract_iocs", "risk": "信息", "empty": not any(iocs.values()), "truncated": False, "kind": "dict"},
+        "iocs": visible_iocs,
+        "data": {"iocs": visible_iocs},
+        "meta": {"tool": "extract_iocs", "risk": "信息", "empty": not any(iocs.values()), "truncated": truncated, "kind": "dict"},
     }
 
 
@@ -301,6 +406,7 @@ def generate_timeline(text='', include_last_triage=True, max_events=100):
     source = ioc_source_text(text, include_last_triage)
     if not source.strip():
         return normalize_tool_result('generate_timeline', {'status': False, 'result': '没有可提取时间线的文本；请传入 text 或先运行 run_quick_triage/run_full_triage'})
+    max_events = clamp_int(max_events, 100, minimum=1, maximum=500)
     events = extract_timeline_events(source, limit=max_events)
     if not events:
         return normalize_tool_result('generate_timeline', '未提取到常见时间格式的事件线索')
@@ -316,26 +422,107 @@ def generate_timeline(text='', include_last_triage=True, max_events=100):
 
 
 @mcp.tool()
-def generate_report(extra_context='', include_iocs=True):
+def analyze_attack_chain(text='', include_last_triage=True, max_stages=8, evidence_limit=3, include_unobserved=True, max_timeline_events=30, max_iocs_per_type=50):
+    """
+    基于输入文本或最近巡检缓存分析攻击链阶段。
+    调用：需要让 AI 客户端复盘初始访问、落地执行、提权、持久化、外联和影响动作时使用。
+    输出：返回攻击阶段表、路径判断、IOC 和时间线数据；max_iocs_per_type 控制 IOC 展示数量。
+    """
+    source = ioc_source_text(text, include_last_triage)
+    if not source.strip():
+        return normalize_tool_result('analyze_attack_chain', {'status': False, 'result': '没有可分析攻击链的文本；请传入 text 或先运行 run_quick_triage/run_full_triage'})
+    max_stages = clamp_int(max_stages, 8, minimum=1, maximum=8)
+    evidence_limit = clamp_int(evidence_limit, 3, minimum=1, maximum=10)
+    max_timeline_events = clamp_int(max_timeline_events, 30, minimum=1, maximum=200)
+    max_iocs_per_type = clamp_int(max_iocs_per_type, 50, minimum=1, maximum=500)
+    ioc_extract_limit = INTERNAL_IOC_LIMIT
+    iocs = extract_ioc_values(source, limit=ioc_extract_limit)
+    timeline_events = extract_timeline_events(source, limit=max_timeline_events)
+    attack_flow = infer_attack_flow(
+        source,
+        iocs=iocs,
+        timeline_events=timeline_events,
+        max_items=max_stages,
+        evidence_limit=evidence_limit,
+        include_unobserved=include_unobserved,
+    )
+    result = f'''## 攻击路径判断
+
+{attack_flow['summary']}
+
+## 攻击阶段表
+
+{attack_flow['markdown']}
+
+## IOC 摘要
+
+{format_ioc_lines(iocs, limit=max_iocs_per_type, extraction_limit=ioc_extract_limit)}
+
+## 时间线摘要
+
+{format_timeline_lines(timeline_events, limit=min(max_timeline_events, 20))}
+'''
+    has_evidence = any(stage['status'] == '发现线索' for stage in attack_flow['stages'])
+    has_network_iocs = any(iocs.get(key) for key in ('ips', 'domains', 'urls'))
+    truncated = iocs_truncated(iocs, max_iocs_per_type, extraction_limit=ioc_extract_limit)
+    return {
+        'status': True,
+        'result': result,
+        'data': {
+            'iocs': trim_iocs(iocs, max_iocs_per_type),
+            'timeline_events': timeline_events,
+            'attack_flow': attack_flow,
+        },
+        'meta': {
+            'tool': 'analyze_attack_chain',
+            'risk': '中' if has_evidence or has_network_iocs else '信息' if any(iocs.values()) or timeline_events else '未发现明显异常',
+            'empty': not has_evidence and not any(iocs.values()) and not timeline_events,
+            'truncated': truncated,
+            'kind': 'dict',
+        },
+    }
+
+
+@mcp.tool()
+def generate_report(extra_context='', include_iocs=True, report_profile='standard', focus='', max_summary_chars=1200, max_findings=12, max_timeline_events=50, max_iocs_per_type=50, evidence_limit=3, include_timeline=True, include_next_tools=True):
     """
     基于最近巡检缓存生成规范化结论报告。
-    调用：完成 quick/full triage 或专项排查后用于整理交付报告。
-    输出：返回包含 banner、摘要、结果表、风险分析、处置建议和后续建议的报告草稿。
+    调用：完成 quick/full triage 或专项排查后用于整理交付报告；可用 report_profile/focus 控制 AI 客户端报告方向。
+    输出：返回包含 banner、摘要、结果表、IOC、时间线、攻击流程、风险分析、处置建议和后续建议的报告草稿。
     """
     content = ioc_source_text(extra_context, include_last_triage=True)
     if not content.strip():
         return '暂无巡检缓存或补充上下文，请先运行 run_quick_triage、run_full_triage 或传入 extra_context'
 
+    profiles = {
+        'standard': '标准应急报告',
+        'executive': '管理层摘要，突出影响、风险和处置优先级',
+        'technical': '技术复盘，突出证据、IOC、时间线和工具依据',
+        'handoff': '交接报告，突出已做检查、未决问题和下一步工具',
+    }
+    report_profile = str(report_profile or 'standard').strip().lower()
+    if report_profile not in profiles:
+        report_profile = 'standard'
+    max_summary_chars = clamp_int(max_summary_chars, 1200, minimum=300, maximum=10000)
+    max_findings = clamp_int(max_findings, 12, minimum=1, maximum=50)
+    max_timeline_events = clamp_int(max_timeline_events, 50, minimum=1, maximum=200)
+    max_iocs_per_type = clamp_int(max_iocs_per_type, 50, minimum=1, maximum=500)
+    evidence_limit = clamp_int(evidence_limit, 3, minimum=1, maximum=10)
+
     triage_type = getattr(ssh_session, 'last_triage_type', '') or 'manual'
-    findings = summarize_triage_sections(content)
-    iocs = extract_ioc_values(content) if include_iocs else {'ips': [], 'domains': [], 'urls': [], 'paths': [], 'ports': []}
-    timeline_events = extract_timeline_events(content, limit=50)
-    attack_flow = infer_attack_flow(content, iocs=iocs, timeline_events=timeline_events)
-    ioc_text = format_ioc_lines(iocs) if include_iocs else '未启用 IOC 提取'
+    findings = summarize_triage_sections(content, max_sections=max_findings)
+    ioc_extract_limit = INTERNAL_IOC_LIMIT
+    iocs = extract_ioc_values(content, limit=ioc_extract_limit) if include_iocs else {'ips': [], 'domains': [], 'urls': [], 'paths': [], 'ports': []}
+    timeline_events = extract_timeline_events(content, limit=max_timeline_events)
+    attack_flow = infer_attack_flow(content, iocs=iocs, timeline_events=timeline_events, evidence_limit=evidence_limit)
+    ioc_text = format_ioc_lines(iocs, limit=max_iocs_per_type, extraction_limit=ioc_extract_limit) if include_iocs else '未启用 IOC 提取'
+    timeline_text = format_timeline_lines(timeline_events, limit=min(max_timeline_events, 15)) if include_timeline else '未启用时间线摘要'
+    next_tools = suggest_next_tools(focus, attack_flow, iocs) if include_next_tools else '未启用后续工具建议'
     has_attack_flow = any(stage['status'] == '发现线索' for stage in attack_flow['stages'])
     risk_note = '发现可疑线索，需结合原始日志和业务上下文人工复核。' if any(iocs.values()) or '[!]' in content or has_attack_flow else '当前摘要未提取到明确 IOC 或攻击阶段证据，仍需结合工具失败、权限不足和截断情况复核。'
-    summary, truncated = truncate_text(content, max_chars=1200)
+    summary, truncated = truncate_text(content, max_chars=max_summary_chars)
     truncated_note = '；报告摘要已截断' if truncated else ''
+    focus_line = f'- 关注方向：{focus}' if str(focus or '').strip() else '- 关注方向：未指定，按通用 Linux 应急响应组织。'
 
     return f'''```text
 {AUTOIR_MCP_BANNER}
@@ -344,6 +531,8 @@ def generate_report(extra_context='', include_iocs=True):
 ## 摘要
 
 - 巡检类型：{triage_type}{truncated_note}
+- 报告画像：{report_profile}（{profiles[report_profile]}）
+{focus_line}
 - 关键摘要：
 
 ```text
@@ -359,6 +548,10 @@ def generate_report(extra_context='', include_iocs=True):
 ## IOC 摘要
 
 {ioc_text}
+
+## 时间线摘要
+
+{timeline_text}
 
 ## 攻击流程分析
 
@@ -377,12 +570,11 @@ def generate_report(extra_context='', include_iocs=True):
 - 优先复核风险为 高/中 的工具输出和 IOC 相关文件、进程、网络连接。
 - 对可疑文件先使用 profile_suspicious_file、hash_file、download_file 固化证据，再决定隔离或清除。
 - 对持久化线索复查 cron、systemd、profile/rc、authorized_keys 和 SUID 文件。
+- 报告中标注“需人工复核”的阶段必须回看原始日志和业务上下文后再定性。
 
 ## 后续建议
 
-- Web 入侵场景：discover_webroots → check_web_logs_auto → check_webshell → check_recent_files → generate_timeline。
-- 账户入侵场景：check_login_success → check_login_fail → check_ssh_keys → check_history → generate_timeline。
-- 持久化场景：check_persistence_summary → check_recent_systemd_changes → extract_iocs → generate_timeline。
+{next_tools}
 '''
 
 
