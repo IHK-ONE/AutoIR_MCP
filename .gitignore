@@ -7,6 +7,7 @@ venv/
 
 # Local runtime artifacts
 downloads/
+extensions/HeMa/result.csv
 *.log
 
 # IDE / OS

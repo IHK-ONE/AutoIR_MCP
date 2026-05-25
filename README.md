@@ -10,8 +10,8 @@ AutoIR_MCP 是一个基于 FastMCP 的 Linux 应急响应 MCP 服务。它通过
 AutoIR_MCP/
 ├── AutoIR_MCP.py              # 启动入口，运行 core.server:mcp
 ├── core/
-│   ├── server.py              # FastMCP app、工具注册、巡检编排和取证工具
-│   ├── prompts.py             # MCP instructions、工具分组、执行链模板、报告规范
+│   ├── server.py              # FastMCP app、工具注册和取证工具
+│   ├── prompts.py             # MCP instructions、工具分组和报告规范
 │   ├── functions.py           # SSH 命令、SFTP、SafeLine、本地规则、IOC/格式化 helper
 │   └── session.py             # SSH session 状态模型
 ├── config.json                # SafeLine 检测接口配置
@@ -27,47 +27,26 @@ pip install -r requirements.txt
 python AutoIR_MCP.py
 ```
 
-## 推荐 MCP 使用流程
+## 使用原则
 
-1. `get_ssh_client`：连接目标主机。
-2. `check_safeline`、`get_system_info`：建立检测上下文。
-3. `run_quick_triage`：快速巡检。
-4. `get_triage_summary`：复用最近巡检缓存。
-5. `extract_iocs`：汇总 IOC，支持 `limit` 控制每类数量。
-6. `generate_timeline`：从巡检缓存或文本中提取事件时间线。
-7. `analyze_attack_chain`：基于证据生成攻击阶段表和攻击路径判断。
-8. `generate_report`：生成规范化报告草稿，支持报告画像和输出范围参数。
-9. 根据发现继续调用专项工具，或使用 `run_full_triage`。
-
-## 工具执行链模板
-
-`get_ir_playbooks` 会返回常用模板，只提供建议流程，不自动执行：
-
-- `quick_linux_ir`：基础连接、SafeLine、系统信息、快速巡检、IOC、时间线、攻击链、报告。
-- `web_intrusion_ir`：Webroot 发现、Web 日志、WebShell、近期文件、IOC、时间线、攻击链、报告。
-- `persistence_ir`：cron、systemd、启动项、shell 初始化、SSH key、持久化摘要、时间线、攻击链、报告。
-- `account_ir`：账户、sudoers、history、SSH key、登录成功/失败统计、IOC、时间线、攻击链、报告。
+AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查路径。AI 客户端应根据用户目标、现场上下文和已有工具输出，自行决定调用哪个单个工具，并自行组织 IOC、时间线、攻击链和结论。
 
 ## 功能清单
 
-### 基础、编排与报告
+### 基础与报告
 
 - `get_ssh_client`：建立 SSH 会话。
 - `check_ssh_session`：检查 SSH 会话是否可用。
 - `close_ssh_client`：关闭当前 SSH 会话。
-- `reset_session`：重置连接和分析缓存。
+- `reset_session`：重置连接和会话状态。
 - `shell`：在已连接的 SSH 目标主机执行命令，返回统一执行结果。
 - `check_safeline`：检查 SafeLine WAF 检测能力。
 - `get_system_info`：采集 hostname、内核、系统版本、时间和 uptime。
-- `get_tool_inventory`：返回工具分类、推荐流程和执行链模板。
-- `get_ir_playbooks`：返回常用应急响应执行链模板。
-- `run_quick_triage`：快速巡检用户、进程、网络、持久化和登录日志。
-- `run_full_triage`：全量巡检，支持 WebShell 和 Rootkit 相关步骤。
-- `get_triage_summary`：读取最近一次巡检缓存。
-- `extract_iocs`：从文本或最近巡检缓存提取 IP、域名、URL、路径和端口，支持 `limit` 控制每类数量。
-- `generate_timeline`：从文本或最近巡检缓存提取事件时间线。
-- `analyze_attack_chain`：从文本或巡检缓存生成攻击阶段表、攻击路径判断、IOC 和时间线数据，支持控制阶段数、证据条数和 IOC 展示数量。
-- `generate_report`：基于巡检缓存生成规范化报告草稿，支持 `report_profile`、`focus`、`max_findings`、`max_timeline_events`、`max_iocs_per_type` 等参数。
+- `get_tool_inventory`：返回工具分类。
+- `extract_iocs`：兼容分析工具；从文本提取 IP、域名、URL、路径和端口，支持 `limit` 控制每类数量。
+- `generate_timeline`：兼容分析工具；从文本提取事件时间线。
+- `analyze_attack_chain`：兼容分析工具；从文本生成攻击阶段表、攻击路径判断、IOC 和时间线数据。
+- `generate_report`：兼容报告工具；基于 `extra_context` 生成规范化报告草稿，支持 `report_profile`、`focus`、`max_findings`、`max_timeline_events`、`max_iocs_per_type` 等参数。
 
 ### 文件、取证与 WebShell
 
@@ -114,7 +93,6 @@ python AutoIR_MCP.py
 
 ### 后门与持久化
 
-- `check_persistence_summary`
 - `check_ld_so_preload`
 - `check_env_preload`
 - `check_alias`
@@ -169,21 +147,25 @@ python AutoIR_MCP.py
 - 大日志默认只分析最近 `max_lines` 行。
 - WebShell 扫描限制文件数量、单文件大小，并阻断 tar 路径穿越和链接逃逸。
 - 可疑文件画像只读取限定头部和限定 strings 片段，不整文件输出。
-- 编排和报告层会把工具输出归一为 `status/result/data/error/meta` 结构，直接检测工具仍优先保持简洁可读。
+- 兼容分析工具会把工具输出归一为 `status/result/data/error/meta` 结构；兼容报告工具返回可读报告文本，直接检测工具仍优先保持简洁可读。
 - 所有工具必须区分“未发现明显异常”和“检测失败”。
 
-## 统一报告输出
+## AI 客户端分析与兼容报告工具
 
-最终报告必须以 `AUTOIR_MCP` 艺术字开头，并使用固定结构：摘要 → 检测结果表 → IOC 摘要 → 时间线摘要 → 攻击流程分析 → 风险分析 → 处置建议 → 后续建议。
+默认设计是纯工具采证：MCP 工具返回主机证据，IOC、时间线和攻击链由 AI 客户端根据提示词自行组织。用户提供 IP、账号密码、入口说明、靶机信息、CTF 题目或应急响应任务时，AI 客户端不得只根据题面直接回答，必须先调用 `get_ssh_client` 建立 SSH 会话。`generate_report` 是调查结束、交付结论或用户要求总结前必须调用的最终汇总工具，用于把已有工具证据整理为规范化报告。
 
-`analyze_attack_chain` 会基于巡检缓存、IOC 和时间线线索生成攻击阶段表。`generate_report` 会复用这些结果生成面向 AI 客户端的报告草稿。分析只做证据化阶段判断，证据不足时必须标注需人工复核，不编造完整攻击链。
+最终汇总报告会输出 banner、案件背景/摘要、检测结果表、IOC 摘要、时间线摘要、攻击流程分析、风险分析、处置原则和 AI 编排说明。分析只做证据化阶段判断，证据不足时必须标注待检测或需人工复核，不编造完整攻击链。
 
-常用报告参数：
+常用参数语义：
 
-- `report_profile`：`standard`、`executive`、`technical`、`handoff`。
-- `focus`：声明关注方向，例如 Web、账户、持久化、挖矿。
-- `max_findings`、`max_timeline_events`、`max_iocs_per_type`、`evidence_limit`：控制输出密度。
-- `include_iocs=false`：仅关闭 IOC 摘要；证据、时间线和攻击链章节仍会保留原始工具输出。
+- `generate_report(report_profile=...)`：调查结束前必须调用；`standard`、`executive`、`technical`、`handoff` 仅影响报告表达侧重点。
+- `generate_report(focus=...)`：声明关注方向，例如 Web、账户、持久化、挖矿；只影响报告聚焦文本，不代表已确认风险。
+- `generate_report(max_findings=..., max_timeline_events=..., max_iocs_per_type=..., evidence_limit=...)`：只控制输出密度，不改变原始证据。
+- `generate_report(include_iocs=False)`：只关闭报告里的 IOC 摘要展示；不会删除摘要中的原始证据文本，时间线、攻击链和风险分析仍会基于原始工具输出识别相关线索。
+- `generate_report(include_timeline=False)`：只关闭时间线摘要章节，不影响摘要、检测结果表或攻击链章节读取原始内容。
+- `generate_report(include_next_tools=...)`：兼容参数；无论取值如何，MCP 服务都不预设后续工具、排查路径或固定顺序。
+- `extract_iocs`、`generate_timeline`、`analyze_attack_chain` 是中间分析工具；`generate_report` 是最终交付前的汇总工具。
+- `extract_iocs(text=...)`、`generate_timeline(text=...)`、`analyze_attack_chain(text=...)`：当前纯工具模式只分析显式传入的 `text`。
 
 检测结果表固定字段：
 
@@ -192,7 +174,7 @@ python AutoIR_MCP.py
 |---|---|---|---|
 ```
 
-风险等级只使用：`高`、`中`、`低`、`信息`、`未发现明显异常`。
+风险等级只使用：`高`、`中`、`低`、`信息`、`未发现明显异常`。工具失败、权限不足、WAF 不可用、输出截断、待检测和需人工复核必须作为报告事实明确呈现。
 
 ## 开发命令
 

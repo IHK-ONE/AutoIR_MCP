@@ -36,10 +36,6 @@ def truncate_text(value, max_chars=4000):
     return value[:max_chars] + "\n[TRUNCATED] output exceeded limit", True
 
 
-def format_tool_output(tool, content, empty_message="未发现明显异常"):
-    return normalize_tool_result(tool, content, empty_message)['result']
-
-
 FAILURE_KEYWORDS = ('错误', '失败', '[ERROR]', '命令超时', '权限不足', 'Traceback', 'exception')
 SUSPICIOUS_KEYWORDS = ('[!]', '可疑', '异常', '后门', 'webshell', 'WebShell', 'deleted exe', '反弹', '挖矿', 'SUID', 'authorized_keys')
 HIGH_RISK_KEYWORDS = ('root 标识用户', '空口令', 'ld.so.preload', 'SSH wrapper', '隐藏 PID')
@@ -122,14 +118,6 @@ def normalize_tool_result(tool, value, empty_message="未发现明显异常"):
             'kind': kind,
         },
     }
-
-
-def result_to_text(tool, value, max_chars=60000):
-    normalized = normalize_tool_result(tool, value)
-    status = 'success' if normalized['status'] else 'failed'
-    header = f'[status={status} risk={normalized["meta"]["risk"]}]'
-    text, _ = truncate_text(normalized['result'], max_chars=max_chars)
-    return f'{header}\n{text}'
 
 
 def unique_limited(values, limit=100):
@@ -323,7 +311,7 @@ def infer_attack_flow(text, iocs=None, timeline_events=None, max_items=8, eviden
         summary = ' → '.join(stage['stage'] for stage in observed[:6])
         summary = f'基于现有证据，疑似攻击链条包含：{summary}。证据仍需结合原始日志人工复核。'
     else:
-        summary = '当前材料不足以还原明确攻击流程，建议补充 Web 日志、认证日志、近期文件和持久化检查。'
+        summary = '当前材料不足以还原明确攻击流程，缺少可支撑阶段判断的工具证据。'
     if timeline_events:
         first_event = timeline_events[0]
         summary += f' 首个时间线线索：{first_event.get("time", "-")} {first_event.get("event", "")}。'

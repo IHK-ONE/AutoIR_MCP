@@ -11,5 +11,3 @@ class SSHSession:
         self.group_list = {}
         self.ps = {}
         self.ip_list = ["127.0.0.1", "localhost", "0.0.0.0"]
-        self.last_triage_summary = ""
-        self.last_triage_type = ""

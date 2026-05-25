@@ -11,7 +11,6 @@ from .functions import (
     first_success,
     IPV4_PATTERN,
     normalize_tool_result,
-    result_to_text,
     get_file_list,
     get_time_path,
     is_safe_path,
@@ -20,7 +19,7 @@ from .functions import (
     sftp_upload,
     truncate_text,
 )
-from .prompts import AUTOIR_MCP_BANNER, IR_PLAYBOOKS, MCP_INSTRUCTIONS, TOOL_CATEGORIES, TOOL_WORKFLOW
+from .prompts import AUTOIR_MCP_BANNER, MCP_INSTRUCTIONS, TOOL_CATEGORIES
 from .session import SSHSession
 import paramiko
 import csv
@@ -36,6 +35,8 @@ from pathlib import Path
 
 base_dir = str(PROJECT_ROOT)
 INTERNAL_IOC_LIMIT = 5000
+SESSION_ERROR = "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+NO_PRESET_NEXT_TOOLS = 'MCP 服务不预设后续工具、排查路径或固定顺序；由 AI 客户端根据用户目标、现场上下文和工具证据自行编排。'
 
 mcp = FastMCP("AutoIR_MCP", instructions=MCP_INSTRUCTIONS)
 
@@ -64,9 +65,10 @@ def check_session(probe=False):
 @mcp.tool()
 def get_ssh_client(ip, port=22, username='root', password=''):
     """
-    建立 SSH 会话并缓存连接。
-    调用：所有远程检测工具前必须先调用；参数为 ip、port、username、password。
-    输出：返回连接状态和失败原因。
+    建立 SSH 会话并缓存连接，是用户提供 IP、端口、账号密码、靶机信息或应急响应题目时必须优先调用的入口工具。
+    调用：看到目标 IP/账号密码/CTF 题目/应急排查任务时，不得直接根据题面回答，必须先调用本工具连接目标；所有远程检测工具前也必须先调用。
+    后续：连接成功后，按用户目标调用专用 check_* / discover_* / profile_* 工具采证；交付结论、结束调查或用户要求总结前必须调用 generate_report 汇总证据。
+    输出：返回连接状态和失败原因；连接失败必须在最终报告中标注检测失败或需人工复核。
     """
 
     global ssh_session
@@ -139,7 +141,7 @@ def close_ssh_client():
 def reset_session(close_connection=True):
     """
     重置当前 MCP 会话状态。
-    调用：需要清空缓存的用户、进程、网络、巡检摘要等状态时使用；默认同时关闭 SSH 连接。
+    调用：需要清空缓存的用户、进程、网络等状态时使用；默认同时关闭 SSH 连接。
     输出：返回重置状态。
     """
     global ssh_session
@@ -167,7 +169,7 @@ def shell(command, timeout=10, max_bytes=200000):
     输出：返回 exec_command 的统一执行结果。
     """
     if not check_session():
-        return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
+        return {"status": False, "result": SESSION_ERROR}
     if not isinstance(command, str) or not command.strip():
         return {"status": False, "result": "command 不能为空"}
     try:
@@ -199,34 +201,17 @@ def check_safeline():
 @mcp.tool()
 def get_tool_inventory():
     """
-    获取 MCP 工具清单和推荐流程。
-    调用：需要了解可用工具、工具分组或默认排查顺序时使用。
-    输出：返回工具分类和推荐流程。
+    获取 MCP 工具清单。
+    调用：需要了解可用纯工具和工具分组时使用；不返回任何预设排查路径。
+    输出：返回工具分类。
     """
     return {
-        "workflow": TOOL_WORKFLOW,
         "categories": TOOL_CATEGORIES,
-        "playbooks": IR_PLAYBOOKS,
     }
 
 
-@mcp.tool()
-def get_ir_playbooks():
-    """
-    获取常用应急响应执行链模板。
-    调用：需要按场景选择工具组合时使用；仅返回建议流程，不自动执行。
-    输出：返回 quick_linux_ir、web_intrusion_ir、persistence_ir、account_ir 模板。
-    """
-    return IR_PLAYBOOKS
-
-
-def ioc_source_text(text='', include_last_triage=True):
-    values = []
-    if text:
-        values.append(str(text))
-    if include_last_triage and getattr(ssh_session, 'last_triage_summary', ''):
-        values.append(ssh_session.last_triage_summary)
-    return '\n'.join(values)
+def ioc_source_text(text=''):
+    return str(text or '')
 
 
 def clamp_int(value, default, minimum=1, maximum=500):
@@ -289,63 +274,7 @@ def format_timeline_lines(events, limit=10):
     return '\n'.join(rows)
 
 
-def suggest_next_tools(focus, attack_flow, iocs):
-    suggestions = []
-    seen = set()
-
-    def add(tool, reason):
-        if tool not in seen:
-            seen.add(tool)
-            suggestions.append((tool, reason))
-
-    focus_text = str(focus or '').lower()
-    if any(keyword in focus_text for keyword in ('web', 'webshell', '站点', '网站')):
-        add('discover_webroots', '确认站点目录')
-        add('check_web_logs_auto', '补充 Web 访问证据')
-        add('check_webshell', '扫描站点落地文件')
-    if any(keyword in focus_text for keyword in ('account', 'ssh', '账户', '登录')):
-        add('check_auth_log', '复核认证日志')
-        add('check_ssh_keys', '排查 SSH 免密入口')
-    if any(keyword in focus_text for keyword in ('persistence', 'backdoor', '持久化', '后门')):
-        add('check_persistence_summary', '汇总持久化线索')
-        add('check_recent_systemd_changes', '复核近期 systemd 变更')
-
-    for stage in attack_flow.get('stages', []):
-        if stage.get('status') != '发现线索':
-            continue
-        name = stage.get('stage', '')
-        if name == '初始访问':
-            add('check_auth_log', '还原登录、爆破或 Web 入口')
-            add('check_web_logs_auto', '补充 Web 初始访问日志')
-        elif name == '执行与落地':
-            add('check_recent_files', '定位近期落地文件')
-            add('profile_suspicious_file', '画像可疑文件')
-        elif name == '权限提升':
-            add('check_sudoers', '复核高权限账户和组')
-            add('check_setuid', '复核 SUID 提权面')
-        elif name == '持久化':
-            add('check_persistence_summary', '展开 cron、systemd、SSH key 和 shell 初始化检查')
-        elif name == '防御规避':
-            add('check_deleted_exe', '排查已删除仍运行进程')
-            add('check_pid', '排查隐藏 PID')
-        elif name == '命令控制/外联':
-            add('check_network', '复核外联连接')
-            add('check_dns_config', '复核 DNS/hosts 劫持')
-        elif name == '影响动作':
-            add('check_mine', '复核挖矿或资源异常')
-            add('check_container_processes', '复核容器内异常进程')
-
-    if iocs.get('paths'):
-        add('profile_suspicious_file', '对 IOC 路径做文件画像')
-    if iocs.get('ips') or iocs.get('domains') or iocs.get('urls'):
-        add('extract_iocs', '复核 IOC 去重结果并用于封禁/溯源')
-    if not suggestions:
-        add('run_full_triage', '材料不足时扩大巡检范围')
-        add('collect_evidence_bundle', '固化关键证据用于离线复盘')
-    return '\n'.join(f'- `{tool}`：{reason}' for tool, reason in suggestions[:8])
-
-
-def summarize_triage_sections(content, max_sections=12):
+def summarize_input_sections(content, max_sections=12):
     rows = []
     current = ''
     body = []
@@ -366,22 +295,22 @@ def summarize_triage_sections(content, max_sections=12):
         text = next((line for line in lines if not line.startswith('[status=')), section_text)
         risk = infer_risk_level(section_text)
         evidence, _ = truncate_text(text, max_chars=160)
-        findings.append(f'| {name} | {evidence.replace("|", "/")} | {risk} | 最近巡检缓存 |')
+        findings.append(f'| {name} | {evidence.replace("|", "/")} | {risk} | 最近输入材料 |')
     if not findings:
-        findings.append('| 巡检缓存 | 暂无可结构化的工具输出 | 信息 | 需补充检测 |')
+        findings.append('| 输入材料 | 暂无可结构化的工具输出 | 信息 | 证据不足 |')
     return '\n'.join(findings)
 
 
 @mcp.tool()
-def extract_iocs(text='', include_last_triage=True, limit=100):
+def extract_iocs(text='', limit=100):
     """
-    从输入文本或最近一次巡检缓存提取 IOC。
-    调用：需要从日志、进程、WebShell、巡检摘要中汇总 IP、域名、URL、路径和端口时使用。
+    从输入文本或最近一次输入材料提取 IOC。
+    调用：需要从日志、进程、WebShell 或其他工具输出中汇总 IP、域名、URL、路径和端口时使用。
     输出：返回去重后的 IOC 字段，不做外部情报查询；limit 控制每类 IOC 最大数量。
     """
-    source = ioc_source_text(text, include_last_triage)
+    source = ioc_source_text(text)
     if not source.strip():
-        return {"status": False, "result": "没有可提取 IOC 的文本；请传入 text 或先运行 run_quick_triage/run_full_triage"}
+        return normalize_tool_result('extract_iocs', {"status": False, "result": "没有可提取 IOC 的文本；请传入 text 或已有工具输出"})
     limit = clamp_int(limit, 100, minimum=1, maximum=500)
     iocs = extract_ioc_values(source, limit=INTERNAL_IOC_LIMIT)
     visible_iocs = trim_iocs(iocs, limit)
@@ -392,20 +321,21 @@ def extract_iocs(text='', include_last_triage=True, limit=100):
         "result": result,
         "iocs": visible_iocs,
         "data": {"iocs": visible_iocs},
+        "error": "",
         "meta": {"tool": "extract_iocs", "risk": "信息", "empty": not any(iocs.values()), "truncated": truncated, "kind": "dict"},
     }
 
 
 @mcp.tool()
-def generate_timeline(text='', include_last_triage=True, max_events=100):
+def generate_timeline(text='', max_events=100):
     """
-    从输入文本或最近巡检缓存生成事件时间线。
+    从输入文本或最近输入材料生成事件时间线。
     调用：需要复盘入侵过程、梳理日志/文件/登录事件先后顺序时使用。
     输出：返回按原始材料出现顺序整理的 markdown 时间线表。
     """
-    source = ioc_source_text(text, include_last_triage)
+    source = ioc_source_text(text)
     if not source.strip():
-        return normalize_tool_result('generate_timeline', {'status': False, 'result': '没有可提取时间线的文本；请传入 text 或先运行 run_quick_triage/run_full_triage'})
+        return normalize_tool_result('generate_timeline', {'status': False, 'result': '没有可提取时间线的文本；请传入 text，或先提供已有工具输出'})
     max_events = clamp_int(max_events, 100, minimum=1, maximum=500)
     events = extract_timeline_events(source, limit=max_events)
     if not events:
@@ -422,15 +352,15 @@ def generate_timeline(text='', include_last_triage=True, max_events=100):
 
 
 @mcp.tool()
-def analyze_attack_chain(text='', include_last_triage=True, max_stages=8, evidence_limit=3, include_unobserved=True, max_timeline_events=30, max_iocs_per_type=50):
+def analyze_attack_chain(text='', max_stages=8, evidence_limit=3, include_unobserved=True, max_timeline_events=30, max_iocs_per_type=50):
     """
-    基于输入文本或最近巡检缓存分析攻击链阶段。
+    基于输入文本或最近输入材料分析攻击链阶段。
     调用：需要让 AI 客户端复盘初始访问、落地执行、提权、持久化、外联和影响动作时使用。
     输出：返回攻击阶段表、路径判断、IOC 和时间线数据；max_iocs_per_type 控制 IOC 展示数量。
     """
-    source = ioc_source_text(text, include_last_triage)
+    source = ioc_source_text(text)
     if not source.strip():
-        return normalize_tool_result('analyze_attack_chain', {'status': False, 'result': '没有可分析攻击链的文本；请传入 text 或先运行 run_quick_triage/run_full_triage'})
+        return normalize_tool_result('analyze_attack_chain', {'status': False, 'result': '没有可分析攻击链的文本；请传入 text，或先提供已有工具输出'})
     max_stages = clamp_int(max_stages, 8, minimum=1, maximum=8)
     evidence_limit = clamp_int(evidence_limit, 3, minimum=1, maximum=10)
     max_timeline_events = clamp_int(max_timeline_events, 30, minimum=1, maximum=200)
@@ -473,6 +403,7 @@ def analyze_attack_chain(text='', include_last_triage=True, max_stages=8, eviden
             'timeline_events': timeline_events,
             'attack_flow': attack_flow,
         },
+        'error': '',
         'meta': {
             'tool': 'analyze_attack_chain',
             'risk': '中' if has_evidence or has_network_iocs else '信息' if any(iocs.values()) or timeline_events else '未发现明显异常',
@@ -484,21 +415,23 @@ def analyze_attack_chain(text='', include_last_triage=True, max_stages=8, eviden
 
 
 @mcp.tool()
-def generate_report(extra_context='', include_iocs=True, report_profile='standard', focus='', max_summary_chars=1200, max_findings=12, max_timeline_events=50, max_iocs_per_type=50, evidence_limit=3, include_timeline=True, include_next_tools=True):
+def generate_report(extra_context='', include_iocs=True, report_profile='standard', focus='', max_summary_chars=1200, max_findings=12, max_timeline_events=50, max_iocs_per_type=50, evidence_limit=3, include_timeline=True, include_next_tools=False):
     """
-    基于最近巡检缓存生成规范化结论报告。
-    调用：完成 quick/full triage 或专项排查后用于整理交付报告；可用 report_profile/focus 控制 AI 客户端报告方向。
-    输出：返回包含 banner、摘要、结果表、IOC、时间线、攻击流程、风险分析、处置建议和后续建议的报告草稿。
+    调查结束前必须调用的最终汇总工具，基于 extra_context 或已有输入材料生成规范化结论报告。任务结束时输出必须附加报告正文。
+    调用：交付结论、结束调查或用户要求总结前必须调用；可用 report_profile/focus 控制报告画像与关注方向。
+    输出：返回包含 banner、案件背景/摘要、检测结果表、IOC、时间线、攻击流程、风险分析、处置原则和 AI 编排说明的报告草稿。
+    要求：检测结果表字段固定为 | 检测项 | 关键发现 | 风险 | 依据 |；风险等级只能使用 高 / 中 / 低 / 信息 / 未发现明显异常；证据不足时标注 待检测 或 需人工复核，不得编造完整攻击链。
     """
-    content = ioc_source_text(extra_context, include_last_triage=True)
-    if not content.strip():
-        return '暂无巡检缓存或补充上下文，请先运行 run_quick_triage、run_full_triage 或传入 extra_context'
+    content = ioc_source_text(extra_context)
+    has_content = bool(content.strip())
+    if not has_content:
+        content = '未提供 extra_context 或已有工具输出；尚未执行检测或当前上下文没有可汇总证据。'
 
     profiles = {
         'standard': '标准应急报告',
         'executive': '管理层摘要，突出影响、风险和处置优先级',
         'technical': '技术复盘，突出证据、IOC、时间线和工具依据',
-        'handoff': '交接报告，突出已做检查、未决问题和下一步工具',
+        'handoff': '交接报告，突出已做检查、未决问题和证据缺口',
     }
     report_profile = str(report_profile or 'standard').strip().lower()
     if report_profile not in profiles:
@@ -509,30 +442,41 @@ def generate_report(extra_context='', include_iocs=True, report_profile='standar
     max_iocs_per_type = clamp_int(max_iocs_per_type, 50, minimum=1, maximum=500)
     evidence_limit = clamp_int(evidence_limit, 3, minimum=1, maximum=10)
 
-    triage_type = getattr(ssh_session, 'last_triage_type', '') or 'manual'
-    findings = summarize_triage_sections(content, max_sections=max_findings)
+    findings = summarize_input_sections(content, max_sections=max_findings)
     ioc_extract_limit = INTERNAL_IOC_LIMIT
-    iocs = extract_ioc_values(content, limit=ioc_extract_limit) if include_iocs else {'ips': [], 'domains': [], 'urls': [], 'paths': [], 'ports': []}
+    iocs = extract_ioc_values(content, limit=ioc_extract_limit)
     timeline_events = extract_timeline_events(content, limit=max_timeline_events)
     attack_flow = infer_attack_flow(content, iocs=iocs, timeline_events=timeline_events, evidence_limit=evidence_limit)
-    ioc_text = format_ioc_lines(iocs, limit=max_iocs_per_type, extraction_limit=ioc_extract_limit) if include_iocs else '未启用 IOC 提取'
+    ioc_text = format_ioc_lines(iocs, limit=max_iocs_per_type, extraction_limit=ioc_extract_limit) if include_iocs else '未启用 IOC 摘要展示'
     timeline_text = format_timeline_lines(timeline_events, limit=min(max_timeline_events, 15)) if include_timeline else '未启用时间线摘要'
-    next_tools = suggest_next_tools(focus, attack_flow, iocs) if include_next_tools else '未启用后续工具建议'
+    next_tools = NO_PRESET_NEXT_TOOLS
     has_attack_flow = any(stage['status'] == '发现线索' for stage in attack_flow['stages'])
-    risk_note = '发现可疑线索，需结合原始日志和业务上下文人工复核。' if any(iocs.values()) or '[!]' in content or has_attack_flow else '当前摘要未提取到明确 IOC 或攻击阶段证据，仍需结合工具失败、权限不足和截断情况复核。'
+    if not has_content:
+        risk_note = '未提供可汇总的工具证据，不能判断是否存在入侵、WebShell、持久化或影响动作；所有结论均应标注为待检测或需人工复核。'
+    elif any(iocs.values()) or '[!]' in content or has_attack_flow:
+        risk_note = '发现可疑线索，需结合原始日志和业务上下文人工复核。'
+    else:
+        risk_note = '当前摘要未提取到明确 IOC 或攻击阶段证据，仍需结合工具失败、权限不足和截断情况复核。'
     summary, truncated = truncate_text(content, max_chars=max_summary_chars)
     truncated_note = '；报告摘要已截断' if truncated else ''
     focus_line = f'- 关注方向：{focus}' if str(focus or '').strip() else '- 关注方向：未指定，按通用 Linux 应急响应组织。'
+    background_line = '- 案件背景：来自用户输入、题目信息、目标信息或已执行 MCP 工具输出。' if has_content else '- 案件背景：未提供可汇总材料；任务背景、目标信息和工具证据均待补充。'
+    evidence_status = '已提供输入材料，以下结论仅基于当前材料。' if has_content else '待检测：未提供 extra_context 或可汇总工具输出。'
 
     return f'''```text
 {AUTOIR_MCP_BANNER}
 ```
 
+## 案件背景
+
+{background_line}
+{focus_line}
+- 报告画像：{report_profile}（{profiles[report_profile]}）
+- 证据状态：{evidence_status}
+
 ## 摘要
 
-- 巡检类型：{triage_type}{truncated_note}
-- 报告画像：{report_profile}（{profiles[report_profile]}）
-{focus_line}
+- 材料来源：extra_context / 工具输出{truncated_note}
 - 关键摘要：
 
 ```text
@@ -544,6 +488,12 @@ def generate_report(extra_context='', include_iocs=True, report_profile='standar
 | 检测项 | 关键发现 | 风险 | 依据 |
 |---|---|---|---|
 {findings}
+
+## 检测状态说明
+
+- 未发现明显异常：仅表示当前材料未见明确异常，不代表目标绝对安全。
+- 检测失败 / 权限不足 / 输出截断：必须按工具原始结果呈现，不能归类为无异常。
+- 待检测 / 需人工复核：表示当前证据不足，不能编造结论。
 
 ## IOC 摘要
 
@@ -565,14 +515,13 @@ def generate_report(extra_context='', include_iocs=True, report_profile='standar
 
 {risk_note}
 
-## 处置建议
+## 处置原则
 
-- 优先复核风险为 高/中 的工具输出和 IOC 相关文件、进程、网络连接。
-- 对可疑文件先使用 profile_suspicious_file、hash_file、download_file 固化证据，再决定隔离或清除。
-- 对持久化线索复查 cron、systemd、profile/rc、authorized_keys 和 SUID 文件。
-- 报告中标注“需人工复核”的阶段必须回看原始日志和业务上下文后再定性。
+- 仅将工具输出作为证据来源，不能把单条线索直接写成已确认失陷。
+- 风险定性必须结合原始日志、业务上下文、权限边界和时间线交叉验证。
+- 报告中标注“需人工复核”的阶段必须回看原始证据后再定性。
 
-## 后续建议
+## AI 编排说明
 
 {next_tools}
 '''
@@ -657,7 +606,7 @@ def check_hijack():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     ssh_session.hijack = False
     ssh_session.hijack_output = []
@@ -722,14 +671,7 @@ def check_home():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
-
-    return '\n'.join(load_home_users())
-
-
-def check_home_nomcp():
-    if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     return '\n'.join(load_home_users())
 
@@ -743,11 +685,11 @@ def check_history():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     output = []
 
     if not ssh_session.user_list:
-        check_home_nomcp()
+        load_home_users()
 
     result = exec_command(ssh_session.client, f'cat /root/.bash_history')
     if result['status'] and result['result']:
@@ -770,7 +712,7 @@ def check_passwd():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, f'cat /etc/passwd')
     output = []
@@ -807,12 +749,12 @@ def check_ssh_keys():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = []
 
     if not ssh_session.user_list:
-        check_home_nomcp()
+        load_home_users()
 
     result = exec_command(ssh_session.client, f'cat /root/.ssh/authorized_keys')
     if result['status'] and result['result']:
@@ -846,7 +788,7 @@ def check_shadow():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, f'cat /etc/shadow')
     output = []
@@ -871,7 +813,7 @@ def check_sudoers():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = []
     result = first_success(ssh_session.client, [
@@ -904,7 +846,7 @@ def check_sudoers():
     return '\n'.join(output) or empty_result()
 
 
-privilege_escalation = ['aa-exec', 'ansible-playbook', 'ansible-test', 'aoss', 'apt-get', 'apt', 'ash', 'at', 'awk',
+privilege_escalation = ['aa-exec', 'aoss', 'apt-get', 'apt', 'ash', 'at', 'awk',
                         'aws', 'bash', 'batcat', 'bconsole', 'bundle', 'bundler', 'busctl', 'busybox', 'byebug', 'c89',
                         'c99', 'cabal', 'capsh', 'cdist', 'certbot', 'check_by_ssh', 'choom', 'cobc', 'composer',
                         'cowsay', 'cowthink', 'cpan', 'cpio', 'cpulimit', 'crash', 'csh', 'csvtool', 'dash', 'dc',
@@ -977,14 +919,7 @@ def get_ps():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
-
-    return f"已获取 {load_processes()} 个进程信息"
-
-
-def get_ps_nomcp():
-    if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     return f"已获取 {load_processes()} 个进程信息"
 
@@ -998,17 +933,17 @@ def check_mine():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     if not ssh_session.ps:
-        get_ps_nomcp()
+        load_processes()
 
     output = ''
     for pid, proc in ssh_session.ps.items():
         cpu, mem, command = proc['cpu'], proc['mem'], proc['command']
         if cpu > 50.0 or mem > 50.0:
             output += f'PID: {pid}\tCPU: {cpu}\tMEM: {mem}\tCOMMAND: {command}\t[!] "疑似挖矿脚本，cpu/mem 占用超过 50%", "red"\n'
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1020,10 +955,10 @@ def check_exec():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     if not ssh_session.ps:
-        get_ps_nomcp()
+        load_processes()
 
     output = ''
     root_command = []
@@ -1047,11 +982,11 @@ def check_exec():
         if command.startswith('[') or command.endswith(']'):
             continue
         for check in privilege_escalation:
-            if check in command:
+            if check == command:
                 output += f'"command: " {command}\t[!] 疑似可 root 提权\n'
                 break
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1063,10 +998,10 @@ def check_pid():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     if not ssh_session.ps:
-        get_ps_nomcp()
+        load_processes()
 
     output = ''
 
@@ -1084,7 +1019,7 @@ def check_pid():
         except (AttributeError, ValueError):
             pass
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1096,7 +1031,7 @@ def check_exe():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
     if ssh_session.ps.keys():
@@ -1116,7 +1051,7 @@ def check_exe():
             except ValueError:
                 pass
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1128,7 +1063,7 @@ def check_mount():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1156,7 +1091,7 @@ def get_localhost():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     ssh_session.ip_list = ["127.0.0.1", "localhost", "0.0.0.0"]
     result = first_success(ssh_session.client, ['ip -4 addr show', 'hostname -I'])
@@ -1212,11 +1147,11 @@ def parse_socket_line(line):
 def check_network():
     """
     分析 ss -anutp 网络连接。
-    调用：排查异常外联、监听端口或后门通信时使用；建议先调用 get_localhost。
+    调用：排查异常外联、监听端口或后门通信时使用；可结合已采集的本机地址判断远程连接。
     输出：返回本地地址、远程地址、进程和连接类型。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = []
 
@@ -1255,7 +1190,7 @@ def check_listening_ports():
     输出：返回协议、本地监听地址、状态和进程线索。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = first_success(ssh_session.client, ['ss -lntup', 'netstat -lntup 2>/dev/null'])
     if not result.get('status'):
@@ -1285,7 +1220,7 @@ def check_eth():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, 'ls /sys/class/net')
 
@@ -1304,7 +1239,7 @@ def check_hosts():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
     standard_hosts = {'127.0.0.1', '127.0.1.1', '::1', 'ff02::1', 'ff02::2'}
@@ -1341,7 +1276,7 @@ def check_bin():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, 'ls -alt /usr/bin')
     if not result['status']:
@@ -1406,7 +1341,7 @@ def check_tmp():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = first_success(ssh_session.client, [
         "find /tmp -type f -printf '%p\t%u:%g\t%m\t%s bytes\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null",
@@ -1425,11 +1360,11 @@ def check_tmp():
 def check_recent_files(path='/tmp', days=7, max_results=200):
     """
     检查指定目录近期变更文件。
-    调用：排查 /tmp、webroot 或用户目录中近期落地的脚本、样本和异常文件时使用。
+    调用：排查 /tmp、webroot、用户目录中近期落地的脚本、样本、隐藏 shell、免杀马或异常文件时使用。
     输出：返回文件路径、属主、权限、大小和修改时间。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     if not isinstance(path, str) or not path.strip() or not path.strip().startswith('/'):
         return "path 必须是目标主机上的绝对路径"
@@ -1460,11 +1395,11 @@ def check_recent_files(path='/tmp', days=7, max_results=200):
 def discover_webroots(max_results=50):
     """
     自动发现常见 Web 根目录。
-    调用：不知道站点目录时使用，后续可接 check_webshell 或 check_recent_files。
+    调用：用户要求 WebShell 查杀、Web 入侵排查、隐藏 shell 路径、免杀马路径或不知道站点目录时使用，后续可接 check_webshell 或 check_recent_files。
     输出：返回 webroot 路径、来源、存在状态和浅层文件数量。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     try:
         max_results = max(1, min(int(max_results), 200))
     except (TypeError, ValueError):
@@ -1517,12 +1452,12 @@ done'''
 def check_webshell(path='/var/www/html', max_files=20000):
     """
     扫描 webroot 中的疑似 WebShell。
-    调用：传入站点目录，工具会打包下载并调用本地扫描器分析。
+    调用：用户要求 WebShell 查杀、Web 入侵排查、查找黑客 shell、隐藏 shell 或免杀马时使用；传入站点目录，工具会打包下载并调用本地扫描器分析。
     输出：返回疑似文件路径、MD5 或扫描器错误。
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
     try:
@@ -1646,7 +1581,7 @@ def check_ld_so_preload():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1671,7 +1606,7 @@ def check_cron():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1693,7 +1628,7 @@ def check_ssh():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1701,7 +1636,7 @@ def check_ssh():
     if result['status'] and result['result'] and '>' in result['result']:
         output += f'content: {result["result"]}\t[!] /usr/sbin/sshd 已被劫持\n'
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1713,7 +1648,7 @@ def check_ssh_wrapper():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1727,7 +1662,7 @@ def check_ssh_wrapper():
                 else:
                     output += f'file: {"/usr/sbin/sshd"}\tcontent: {malicious}\t[!] ssh wrapper 劫持\n'
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1739,10 +1674,10 @@ def check_inetd():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = check_malicious_content('/etc/inetd.conf')
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1754,14 +1689,14 @@ def check_xinetd():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
     for file in get_files('/etc/xinetd.conf/'):
         output += check_malicious_content(f'/etc/xinetd.conf/{file}')
 
-    return output
+    return output or empty_result()
 
 
 @mcp.tool()
@@ -1773,7 +1708,7 @@ def check_setuid():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1799,7 +1734,7 @@ def check_startup():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1825,7 +1760,7 @@ def check_profile():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1844,7 +1779,7 @@ def check_rc():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     output = ''
 
@@ -1881,7 +1816,7 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     try:
         max_lines = max(1, min(int(max_lines), 50000))
@@ -1950,7 +1885,7 @@ def check_login_success():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = first_success(ssh_session.client, [
         'last',
@@ -1975,7 +1910,7 @@ def check_login_fail():
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = first_success(ssh_session.client, [
         'lastb',
@@ -2000,7 +1935,7 @@ def RookitUpload(install=False):
     """
 
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     local_rkhunter = Path(base_dir) / 'extensions' / 'rkhunter.gz'
     remote_archive = f'/tmp/autoir_rkhunter_{get_time_path()}.tar.gz'
@@ -2035,7 +1970,7 @@ def get_system_info():
     输出：返回 hostname、系统版本、内核、时间和运行时长。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     command = "printf 'hostname: '; hostname; printf 'kernel: '; uname -a; printf 'date: '; date; printf 'uptime: '; uptime; printf 'os-release:\n'; cat /etc/os-release 2>/dev/null"
     result = exec_command(ssh_session.client, command, timeout=10, max_bytes=20000)
@@ -2052,7 +1987,7 @@ def check_alias():
     输出：返回可疑 alias 定义和来源文件。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     paths = ['/root/.bashrc', '/root/.bash_profile', '/root/.profile', '/etc/bashrc', '/etc/profile']
     for user in load_home_users():
@@ -2077,7 +2012,7 @@ def check_env_preload():
     输出：返回变量来源、变量名和值。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     names = 'LD_PRELOAD|LD_AOUT_PRELOAD|LD_ELF_PRELOAD|LD_LIBRARY_PATH|PROMPT_COMMAND|BASH_ENV|ENV'
     paths = ['/root/.bashrc', '/root/.bash_profile', '/root/.profile', '/etc/bashrc', '/etc/profile', '/etc/environment']
@@ -2105,7 +2040,7 @@ def check_fstab():
     输出：返回可疑挂载项。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, 'cat /etc/fstab 2>/dev/null')
     if not result['status']:
@@ -2129,7 +2064,7 @@ def check_systemd_timers():
     输出：返回 timer 列表和可疑文件内容。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = first_success(ssh_session.client, [
         "systemctl list-timers --all --no-pager 2>/dev/null",
@@ -2148,7 +2083,7 @@ def check_service_execstart():
     输出：返回可疑服务文件和 ExecStart 内容。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     command = r"grep -RInE 'Exec(Start|StartPre|StartPost)=.*(bash -i|/dev/tcp|curl|wget|nc |ncat|socat|python -c|perl -e|chmod \+s)' /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system 2>/dev/null"
     result = exec_command(ssh_session.client, command, timeout=30, max_bytes=120000)
@@ -2167,7 +2102,7 @@ def check_deleted_exe():
     输出：返回 PID 和 deleted exe 指向。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, "ls -al /proc/*/exe 2>/dev/null | grep 'deleted'", timeout=20)
     if result['status'] and result['result']:
@@ -2185,7 +2120,7 @@ def check_dns_config():
     输出：返回 resolv.conf 内容和可疑 nameserver。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, 'cat /etc/resolv.conf 2>/dev/null')
     if not result['status']:
@@ -2208,7 +2143,7 @@ def check_auth_log(max_lines=5000):
     输出：返回关键认证事件统计。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     try:
         max_lines = max(1, min(int(max_lines), 50000))
@@ -2241,7 +2176,7 @@ def check_web_logs_auto(max_lines=3000):
     输出：返回已发现日志路径和分析摘要。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
 
     result = exec_command(ssh_session.client, "find /var/log -maxdepth 3 -type f \\( -name 'access.log' -o -name '*access*.log' -o -name 'access_log' \\) 2>/dev/null", timeout=20)
     if not result['status']:
@@ -2278,7 +2213,7 @@ def stat_file(path):
     输出：返回 stat 信息，失败时 fallback 到 ls -al。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     if not isinstance(path, str) or not path.strip():
         return "path 不能为空"
     quoted = quote_remote_path(path.strip())
@@ -2299,7 +2234,7 @@ def hash_file(path, algorithm='sha256'):
     输出：返回 md5/sha1/sha256 哈希。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     algorithms = {'sha256': 'sha256sum', 'sha1': 'sha1sum', 'md5': 'md5sum'}
     algorithm = str(algorithm).lower().strip()
     if algorithm not in algorithms:
@@ -2319,7 +2254,7 @@ def profile_suspicious_file(path, max_preview_lines=40, max_strings=80):
     输出：返回文件元数据、sha256、file 类型、头部预览、strings 片段和风险提示。
     """
     if not check_session():
-        return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
+        return {"status": False, "result": SESSION_ERROR}
     if not isinstance(path, str) or not path.strip():
         return {"status": False, "result": "path 不能为空"}
     try:
@@ -2402,7 +2337,7 @@ def download_file(remote_path, local_dir='downloads/evidence', max_bytes=100 * 1
     输出：返回本地路径、远程路径和下载状态。
     """
     if not check_session():
-        return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
+        return {"status": False, "result": SESSION_ERROR}
     if not isinstance(remote_path, str) or not remote_path.strip():
         return {"status": False, "result": "remote_path 不能为空"}
     try:
@@ -2441,7 +2376,7 @@ def upload_file(local_path, remote_path):
     输出：返回上传状态和错误原因。
     """
     if not check_session():
-        return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
+        return {"status": False, "result": SESSION_ERROR}
     local = Path(local_path).expanduser().resolve()
     if not local.is_file():
         return {"status": False, "result": f"本地文件不存在: {local}"}
@@ -2466,7 +2401,7 @@ def collect_evidence_bundle(include_logs=True, include_files=False):
     输出：返回本地 bundle 目录和生成的文件列表。
     """
     if not check_session():
-        return {"status": False, "result": "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"}
+        return {"status": False, "result": SESSION_ERROR}
     bundle_dir = Path(base_dir) / 'downloads' / 'evidence_bundle' / get_time_path()
     bundle_dir.mkdir(parents=True, exist_ok=True)
     commands = {
@@ -2499,7 +2434,7 @@ def list_services():
     输出：返回 service 列表。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     result = first_success(ssh_session.client, [
         'systemctl list-units --type=service --all --no-pager 2>/dev/null',
         'service --status-all 2>/dev/null',
@@ -2517,7 +2452,7 @@ def check_enabled_services():
     输出：返回 enabled service 列表。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     result = exec_command(ssh_session.client, 'systemctl list-unit-files --type=service --state=enabled --no-pager 2>/dev/null', timeout=20, max_bytes=200000)
     if not result['status']:
         return command_failure(result, '开机自启服务获取失败')
@@ -2532,7 +2467,7 @@ def check_recent_systemd_changes(days=7):
     输出：返回最近修改的 systemd 文件。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     try:
         days = max(1, min(int(days), 365))
     except (TypeError, ValueError):
@@ -2569,7 +2504,7 @@ def check_docker_containers():
     输出：返回容器列表或不可用原因。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     runtime = container_runtime()
     if not runtime:
         return empty_result('未发现 docker/podman 命令')
@@ -2587,7 +2522,7 @@ def check_container_mounts():
     输出：返回容器挂载摘要。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     runtime = container_runtime()
     if not runtime:
         return empty_result('未发现 docker/podman 命令')
@@ -2614,7 +2549,7 @@ def check_container_processes():
     输出：返回容器 top 进程摘要。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     runtime = container_runtime()
     if not runtime:
         return empty_result('未发现 docker/podman 命令')
@@ -2637,7 +2572,7 @@ def check_user_crontabs():
     输出：返回每个用户的 crontab 和 spool 文件线索。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     command = """awk -F: '$7 !~ /(nologin|false)$/ {print $1}' /etc/passwd 2>/dev/null | head -n 200 | while IFS= read -r user; do crontab=$(crontab -l -u "$user" 2>/dev/null); if [ -n "$crontab" ]; then printf '## user: %s\n%s\n\n' "$user" "$crontab"; fi; done"""
     result = exec_command(ssh_session.client, command, timeout=60, max_bytes=300000)
     output = []
@@ -2657,7 +2592,7 @@ def check_at_jobs():
     输出：返回 atq 列表和任务内容。
     """
     if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
+        return SESSION_ERROR
     result = exec_command(ssh_session.client, 'atq 2>/dev/null', timeout=10)
     if not result['status'] or not result['result']:
         if result.get('exit_status') in (0, 1, None):
@@ -2672,126 +2607,6 @@ def check_at_jobs():
                 output.append(f'## at job {job_id}\n{job["result"]}')
     return '\n\n'.join(output)
 
-
-def quick_persistence_tools():
-    return (
-        check_ld_so_preload,
-        check_env_preload,
-        check_alias,
-        check_cron,
-        check_user_crontabs,
-        check_at_jobs,
-        check_startup,
-    )
-
-
-def full_persistence_extra_tools():
-    return (
-        check_ssh,
-        check_ssh_wrapper,
-        check_inetd,
-        check_xinetd,
-        check_setuid,
-        check_profile,
-        check_rc,
-        check_fstab,
-        check_systemd_timers,
-        check_service_execstart,
-    )
-
-
-def persistence_tools():
-    return quick_persistence_tools() + (check_ssh_keys,) + full_persistence_extra_tools()
-
-
-@mcp.tool()
-def check_persistence_summary():
-    """
-    汇总持久化检测结果。
-    调用：需要一次性查看 cron、systemd、启动项、shell 初始化、SSH key 等持久化线索时使用。
-    输出：返回各持久化检测工具的摘要。
-    """
-    if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
-    return run_tool_sequence(persistence_tools())
-
-
-@mcp.tool()
-def get_triage_summary():
-    """
-    获取最近一次 quick/full triage 结果缓存。
-    调用：需要复用最近巡检结果、避免重复执行重命令时使用。
-    输出：返回缓存摘要或提示先运行巡检。
-    """
-    if not getattr(ssh_session, 'last_triage_summary', ''):
-        return '暂无巡检缓存，请先运行 run_quick_triage 或 run_full_triage'
-    return f'巡检类型: {getattr(ssh_session, "last_triage_type", "unknown")}\n\n{ssh_session.last_triage_summary}'
-
-
-def run_tool_sequence(tools):
-    results = []
-    for func in tools:
-        tool_name = func.__name__
-        try:
-            value = func()
-            results.append(f'## {tool_name}\n{result_to_text(tool_name, value)}')
-        except Exception as error:
-            results.append(f'## {tool_name}\n[status=failed risk=低]\n[ERROR] {error}')
-    return '\n\n'.join(results)
-
-
-@mcp.tool()
-def run_quick_triage():
-    """
-    执行快速应急巡检。
-    调用：需要低耗时覆盖用户、进程、网络、持久化和登录日志时使用；必须先建立 SSH。
-    输出：返回各检测工具摘要，单项失败不影响后续检测。
-    """
-    if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
-    tools = (
-        check_safeline, get_system_info, check_hijack, check_home, check_passwd, check_shadow,
-        check_sudoers, check_ssh_keys, check_history, get_ps, check_mine, check_exec,
-        check_deleted_exe, get_localhost, check_network, check_hosts, check_dns_config,
-        *quick_persistence_tools(), list_services, check_enabled_services, check_docker_containers,
-        check_login_success, check_login_fail,
-    )
-    result = run_tool_sequence(tools)
-    ssh_session.last_triage_type = 'quick'
-    ssh_session.last_triage_summary = result
-    return result
-
-
-@mcp.tool()
-def run_full_triage(webroot='/var/www/html', include_webshell=True, include_rootkit=False):
-    """
-    执行全量应急巡检。
-    调用：需要全面排查用户、进程、网络、文件、持久化、日志和 rootkit 线索时使用；必须先建立 SSH。
-    输出：返回各检测工具摘要，单项失败不影响后续检测。
-    """
-    if not check_session():
-        return "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
-    output = [run_quick_triage()]
-    extra_tools = (
-        check_pid, check_exe, check_mount, check_eth, check_bin, check_tmp,
-        *full_persistence_extra_tools(), check_recent_systemd_changes,
-        check_container_mounts, check_container_processes, check_auth_log, check_web_logs_auto,
-    )
-    output.append(run_tool_sequence(extra_tools))
-    if include_webshell:
-        try:
-            output.append(f'## check_webshell\n{result_to_text("check_webshell", check_webshell(path=webroot))}')
-        except Exception as error:
-            output.append(f'## check_webshell\n[status=failed risk=低]\n[ERROR] {error}')
-    if include_rootkit:
-        try:
-            output.append(f'## RookitUpload\n{result_to_text("RookitUpload", RookitUpload())}')
-        except Exception as error:
-            output.append(f'## RookitUpload\n[status=failed risk=低]\n[ERROR] {error}')
-    result = '\n\n'.join(output)
-    ssh_session.last_triage_type = 'full'
-    ssh_session.last_triage_summary = result
-    return result
 
 
 if __name__ == "__main__":
