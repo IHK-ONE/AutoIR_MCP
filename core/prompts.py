@@ -84,6 +84,7 @@ MCP_INSTRUCTIONS = f"""
 - 必须以如下 AUTOIR_MCP 艺术字开头，放在 text 代码块中：
 {AUTOIR_MCP_BANNER}
 - 报告结构由 AI 客户端基于题目信息、用户目标和工具证据自行组织，可包含案件背景、摘要、检测结果表、IOC 摘要、时间线摘要、攻击流程分析、风险分析、处置原则和 AI 编排说明。
+- 调用 generate_report 前，AI 客户端必须先按固定模板自行填充结构化参数：case={{案件名称/目标/系统/Web根目录}}；findings=[{{检测项,关键发现,风险,依据}}]；timeline=[{{时间,事件,来源}}]；iocs={{IP,域名,URL,路径,端口,哈希,用户,User-Agent}}；answers={{题号:答案}}。
 - 检测结果表字段固定为：| 检测项 | 关键发现 | 风险 | 依据 |。
 - 攻击流程分析必须基于工具输出、IOC 和时间线线索；证据不足时标注“需人工复核”，不得编造完整攻击链。
 - generate_report 是调查结束前必须调用的最终汇总工具；可用 report_profile=standard/executive/technical/handoff 和 focus 指定报告画像与关注方向。

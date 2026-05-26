@@ -46,7 +46,7 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `extract_iocs`：兼容分析工具；从文本提取 IP、域名、URL、路径和端口，支持 `limit` 控制每类数量。
 - `generate_timeline`：兼容分析工具；从文本提取事件时间线。
 - `analyze_attack_chain`：兼容分析工具；从文本生成攻击阶段表、攻击路径判断、IOC 和时间线数据。
-- `generate_report`：兼容报告工具；基于 `extra_context` 生成规范化报告草稿，支持 `report_profile`、`focus`、`max_findings`、`max_timeline_events`、`max_iocs_per_type` 等参数。
+- `generate_report`：兼容报告工具；优先基于结构化 `case`、`findings`、`timeline`、`iocs`、`answers` 渲染规范化报告，`extra_context` 仅作为旧调用兜底，支持 `output_mode='file'` 落盘避免返回截断。
 
 ### 文件、取证与 WebShell
 
@@ -158,11 +158,18 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 
 常用参数语义：
 
+- `generate_report(case=...)`：结构化案件背景，建议包含 `title`、`target`、`system`、`webroot`。
+- `generate_report(findings=...)`：结构化检测结论列表，固定字段为 `item`、`finding`、`risk`、`evidence`；检测结果表直接由该 schema 渲染，不再靠长文本猜测。
+- `generate_report(timeline=...)`：结构化时间线列表，建议字段为 `time`、`event`、`source`；也可直接传 `generate_timeline` 的工具结果。
+- `generate_report(iocs=...)`：结构化 IOC 字典，支持 `ips`、`domains`、`urls`、`paths`、`ports`；也可直接传 `extract_iocs` 的工具结果。
+- `generate_report(answers=...)`：专项题目、CTF 或调查问答的结构化答案，支持字典或 `question/answer` 列表。
+- `generate_report(output_mode=...)`：默认 `inline`，保持旧版完整 markdown 返回；`preview` 返回短预览；`file` 写入 `downloads/reports/<timestamp>/report.md`，并在 `result` 返回可直接展示的短报告、完整报告路径和末尾答案；`both` 同时返回完整报告和交付预览。
+- `generate_report(extra_context=...)`：兼容旧调用的兜底摘要字段；不要直接传入大段原始日志，应先 `raw_log -> filter/slice -> structured_events/findings -> report`。
 - `generate_report(report_profile=...)`：调查结束前必须调用；`standard`、`executive`、`technical`、`handoff` 仅影响报告表达侧重点。
 - `generate_report(focus=...)`：声明关注方向，例如 Web、账户、持久化、挖矿；只影响报告聚焦文本，不代表已确认风险。
 - `generate_report(max_findings=..., max_timeline_events=..., max_iocs_per_type=..., evidence_limit=...)`：只控制输出密度，不改变原始证据。
-- `generate_report(include_iocs=False)`：只关闭报告里的 IOC 摘要展示；不会删除摘要中的原始证据文本，时间线、攻击链和风险分析仍会基于原始工具输出识别相关线索。
-- `generate_report(include_timeline=False)`：只关闭时间线摘要章节，不影响摘要、检测结果表或攻击链章节读取原始内容。
+- `generate_report(include_iocs=False)`：只关闭报告里的 IOC 摘要展示。
+- `generate_report(include_timeline=False)`：只关闭时间线摘要章节。
 - `generate_report(include_next_tools=...)`：兼容参数；无论取值如何，MCP 服务都不预设后续工具、排查路径或固定顺序。
 - `extract_iocs`、`generate_timeline`、`analyze_attack_chain` 是中间分析工具；`generate_report` 是最终交付前的汇总工具。
 - `extract_iocs(text=...)`、`generate_timeline(text=...)`、`analyze_attack_chain(text=...)`：当前纯工具模式只分析显式传入的 `text`。

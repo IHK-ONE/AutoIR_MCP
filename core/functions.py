@@ -147,6 +147,14 @@ PORT_PATTERNS = (
     re.compile(r'(?i)\b(?:port|端口)\s*[:=]?\s*([1-9]\d{0,4})\b'),
     re.compile(r'\b(?:\d{1,3}(?:\.\d{1,3}){3}|localhost|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)[:：]([1-9]\d{0,4})\b'),
 )
+HASH_PATTERN = re.compile(r'\b(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\b')
+USER_AGENT_PATTERN = re.compile(r'(?i)\b(?:user[-_ ]?agent|ua)\s*[:=：]\s*["\']?([^\r\n"\']+?)(?=\s+(?:user[-_ ]?agent|ua|user|username|account|ip|path|url|domain|port|md5|sha1|sha256|用户|账号|账户|路径|端口|哈希)\s*[:=：]|["\']|$)')
+COMBINED_LOG_USER_AGENT_PATTERN = re.compile(r'"[^"\r\n]*"\s+"([^"\r\n]+)"\s*$')
+USER_PATTERNS = (
+    re.compile(r'(?i)\b(?:user|username|account|用户|账号|账户)\s*[:=：]\s*([A-Za-z0-9_][\w.-]{0,63})'),
+    re.compile(r'(?i)\binvalid\s+user\s+([A-Za-z0-9_][\w.-]{0,63})\b'),
+    re.compile(r'(?i)\b(?:Accepted|Failed)\s+password\s+for\s+(?:invalid\s+user\s+)?([A-Za-z0-9_][\w.-]{0,63})\b'),
+)
 NOISE_DOMAIN_SUFFIXES = {'php', 'jsp', 'jspx', 'asp', 'aspx', 'sh', 'py', 'pl', 'txt', 'log', 'conf', 'ini'}
 
 
@@ -200,12 +208,20 @@ def extract_ioc_values(text, limit=100):
     ports = []
     for pattern in PORT_PATTERNS:
         ports.extend(match for match in pattern.findall(text) if valid_port(match))
+    users = []
+    for pattern in USER_PATTERNS:
+        users.extend(pattern.findall(text))
+    user_agents = USER_AGENT_PATTERN.findall(text)
+    user_agents.extend(agent for agent in COMBINED_LOG_USER_AGENT_PATTERN.findall(text) if agent != '-')
     return {
         'ips': ips,
         'domains': unique_limited(url_hosts + domains, limit),
         'urls': urls,
         'paths': paths,
         'ports': unique_limited(ports, limit),
+        'hashes': unique_limited(HASH_PATTERN.findall(text), limit),
+        'users': unique_limited(users, limit),
+        'user_agents': unique_limited(user_agents, limit),
     }
 
 
@@ -298,10 +314,12 @@ def infer_attack_flow(text, iocs=None, timeline_events=None, max_items=8, eviden
     stages = []
     for stage, _ in rules:
         evidence = list(evidence_by_stage.get(stage, []))
-        if stage == '命令控制/外联' and any(iocs.get(key) for key in ('ips', 'domains', 'urls', 'ports')):
-            ioc_summary = ', '.join((iocs.get('ips') or [])[:3] + (iocs.get('domains') or [])[:3] + (iocs.get('urls') or [])[:2])
-            if ioc_summary:
-                evidence.insert(0, f'IOC: {ioc_summary}')
+        if stage == '命令控制/外联':
+            suspicious_ports = [port for port in (iocs.get('ports') or []) if valid_port(port) and int(port) > 1024]
+            if any(iocs.get(key) for key in ('ips', 'domains', 'urls')) or suspicious_ports:
+                ioc_summary = ', '.join((iocs.get('ips') or [])[:3] + (iocs.get('domains') or [])[:3] + (iocs.get('urls') or [])[:2] + suspicious_ports[:3])
+                if ioc_summary:
+                    evidence.insert(0, f'IOC: {ioc_summary}')
         status = '发现线索' if evidence else '未发现明显线索'
         if include_unobserved or evidence:
             stages.append({'stage': stage, 'status': status, 'evidence': evidence[:evidence_limit]})

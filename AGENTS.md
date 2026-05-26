@@ -30,10 +30,13 @@ AutoIR_MCP 只提供纯 MCP 工具和工具证据，不提供任何预设排查�
 - `extract_iocs(limit=...)`：控制每类 IOC 的最大数量。
 - `extract_iocs(text=...)`、`generate_timeline(text=...)`、`analyze_attack_chain(text=...)`：当前纯工具模式只分析显式传入的 `text`。
 - `analyze_attack_chain(max_stages=..., evidence_limit=..., include_unobserved=..., max_iocs_per_type=...)`：控制攻击阶段深度、证据密度和 IOC 展示密度。
+- `generate_report(case=..., findings=..., timeline=..., iocs=..., answers=...)`：优先传结构化报告上下文；`findings` 固定使用 `item/finding/risk/evidence` schema，检测结果表直接由 schema 渲染；`timeline`/`iocs` 可直接接收 `generate_timeline`/`extract_iocs` 工具结果，`answers` 支持字典或 `question/answer` 列表。
+- `generate_report(extra_context=...)`：仅作为旧调用兜底摘要；长日志必须先过滤、切片并整理成 findings/timeline/iocs，不要把原始日志全文塞给报告工具。
+- `generate_report(output_mode=...)`：默认 `inline`，保持旧版完整 markdown 返回；`preview` 返回短预览；`file` 写入 `downloads/reports/<timestamp>/report.md`，并在 `result` 返回可直接展示的短报告、完整报告路径和末尾答案；`both` 同时返回完整报告和交付预览。
 - `generate_report(report_profile=..., focus=...)`：根据受众选择 `standard`、`executive`、`technical` 或 `handoff`；`focus` 只表示关注方向。
 - `generate_report(max_summary_chars=..., max_findings=..., max_timeline_events=..., max_iocs_per_type=..., evidence_limit=...)`：只控制输出密度，不改变原始证据。
 - `generate_report(include_timeline=...)`：仅关闭时间线摘要章节；`include_next_tools` 是兼容参数，不会让 MCP 服务预设后续工具、排查路径或固定顺序。
-- `generate_report(include_iocs=False)`：只关闭报告里的 IOC 摘要展示；不会删除摘要中的原始证据文本，时间线、攻击链和风险分析仍会基于原始工具输出识别相关线索。
+- `generate_report(include_iocs=False)`：只关闭报告里的 IOC 摘要展示。
 
 除非明确要求，不要在 MCP 服务内部添加外部 LLM/API 调用。服务端应负责提供纯工具证据；最终推理由 AI 客户端完成，最终文字交付应调用 `generate_report` 汇总已有证据。
 

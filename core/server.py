@@ -28,6 +28,7 @@ import tarfile
 import hashlib
 import subprocess
 import collections
+import ipaddress
 import re
 import shlex
 import urllib.parse
@@ -37,6 +38,8 @@ base_dir = str(PROJECT_ROOT)
 INTERNAL_IOC_LIMIT = 5000
 SESSION_ERROR = "错误：SSH连接未建立或已断开，请先调用 get_ssh_client 建立连接"
 NO_PRESET_NEXT_TOOLS = 'MCP 服务不预设后续工具、排查路径或固定顺序；由 AI 客户端根据用户目标、现场上下文和工具证据自行编排。'
+VALID_REPORT_RISKS = {'高', '中', '低', '信息', '未发现明显异常'}
+REPORT_OUTPUT_MODES = {'inline', 'preview', 'file', 'both'}
 
 mcp = FastMCP("AutoIR_MCP", instructions=MCP_INSTRUCTIONS)
 
@@ -243,6 +246,9 @@ def format_ioc_lines(iocs, limit=50, extraction_limit=None):
         'urls': 'URL',
         'paths': '路径',
         'ports': '端口',
+        'hashes': '哈希',
+        'users': '用户',
+        'user_agents': 'User-Agent',
     }
     limit = clamp_int(limit, 50, minimum=1, maximum=500)
     extraction_limit = clamp_int(extraction_limit, 0, minimum=0, maximum=INTERNAL_IOC_LIMIT) if extraction_limit else None
@@ -299,6 +305,372 @@ def summarize_input_sections(content, max_sections=12):
     if not findings:
         findings.append('| 输入材料 | 暂无可结构化的工具输出 | 信息 | 证据不足 |')
     return '\n'.join(findings)
+
+
+def parse_json_like(value, default):
+    if value is None or value == '':
+        return default
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+    if isinstance(parsed, type(default)):
+        return parsed
+    if isinstance(default, list) and isinstance(parsed, dict):
+        return [parsed] if parsed else []
+    return default
+
+
+def sanitize_report_cell(value, max_chars=240):
+    text = ' '.join(('' if value is None else str(value)).split())
+    text = text.replace('|', '/')
+    text, truncated = truncate_text(text, max_chars=max_chars)
+    return text.replace('\n[TRUNCATED] output exceeded limit', '…') if truncated else text
+
+
+def normalize_report_risk(value):
+    risk = str(value or '信息').strip()
+    aliases = {'高危': '高', '严重': '高', 'high': '高', 'critical': '高', '中危': '中', 'medium': '中', '低危': '低', 'low': '低', 'info': '信息', 'informational': '信息'}
+    risk = aliases.get(risk, aliases.get(risk.lower(), risk))
+    return risk if risk in VALID_REPORT_RISKS else '信息'
+
+
+def normalize_evidence(value, evidence_limit=3):
+    if value is None:
+        items = []
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [value]
+    evidence = [sanitize_report_cell(item, max_chars=320) for item in items if item is not None and str(item).strip()]
+    return evidence[:evidence_limit] or ['证据不足，需人工复核']
+
+
+def first_present(mapping, keys):
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def normalize_findings(findings, evidence_limit=3, max_findings=12):
+    raw = parse_json_like(findings, {})
+    if isinstance(raw, dict) and isinstance(raw.get('findings'), list):
+        source = raw['findings']
+    elif isinstance(raw, dict) and isinstance(raw.get('data'), list):
+        source = raw['data']
+    elif isinstance(raw, dict) and any(key in raw for key in ('status', 'result', 'data', 'error', 'meta')):
+        source = []
+    else:
+        source = parse_json_like(findings, [])
+    normalized = []
+    for index, item in enumerate(source[:max_findings], start=1):
+        if not isinstance(item, dict):
+            item = {'item': f'检测项 {index}', 'finding': item}
+        name = first_present(item, ['item', 'name', 'title', '检测项', '检查项', '项目']) or f'检测项 {index}'
+        path = first_present(item, ['path', 'file', '路径', '文件'])
+        finding = first_present(item, ['finding', 'summary', 'result', 'description', 'event', '关键发现', '发现', '结果', '描述', '事件'])
+        evidence_value = first_present(item, ['evidence', 'evidences', 'basis', 'proof', '依据', '证据', '证明'])
+        risk_value = first_present(item, ['risk', '风险', '风险等级'])
+        risk = normalize_report_risk(risk_value)
+        if finding is None:
+            if risk == '未发现明显异常':
+                finding = '未发现明显异常'
+            else:
+                finding = f'发现{name}' if risk_value is not None or path is not None or evidence_value is not None else '待检测，需人工复核'
+        if path is not None:
+            finding = f'{finding}（路径：{path}）'
+        evidence = normalize_evidence(evidence_value, evidence_limit=evidence_limit)
+        if path is not None and all(str(path) not in entry for entry in evidence):
+            evidence = [sanitize_report_cell(path, max_chars=320)] + evidence[:max(0, evidence_limit - 1)]
+        normalized.append({
+            'item': sanitize_report_cell(name, max_chars=120),
+            'finding': sanitize_report_cell(finding, max_chars=240),
+            'risk': risk,
+            'evidence': evidence,
+        })
+    return normalized
+
+
+def format_findings_rows(findings):
+    if not findings:
+        return '| 检测状态 | 暂无结构化检测结果 | 信息 | 需补充 findings 列表或人工复核 |'
+    rows = []
+    for finding in findings:
+        evidence = '<br>'.join(finding['evidence'])
+        rows.append(f'| {finding["item"]} | {finding["finding"]} | {finding["risk"]} | {evidence} |')
+    return '\n'.join(rows)
+
+
+def normalize_report_timeline(timeline, max_events=50):
+    raw = parse_json_like(timeline, {})
+    if isinstance(raw.get('data'), dict) and isinstance(raw['data'].get('events'), list):
+        source = raw['data']['events']
+    elif isinstance(raw.get('data'), dict) and isinstance(raw['data'].get('timeline_events'), list):
+        source = raw['data']['timeline_events']
+    elif isinstance(raw.get('data'), list):
+        source = raw['data']
+    elif isinstance(raw.get('events'), list):
+        source = raw['events']
+    elif isinstance(raw.get('timeline_events'), list):
+        source = raw['timeline_events']
+    elif any(key in raw for key in ('status', 'result', 'data', 'error', 'meta')):
+        source = []
+    else:
+        source = parse_json_like(timeline, [])
+    events = []
+    for index, item in enumerate(source[:max_events], start=1):
+        if not isinstance(item, dict):
+            item = {'event': item}
+        event = first_present(item, ['event', 'description', 'desc', 'meaning', '事件', '描述', '含义']) or '事件待复核'
+        events.append({
+            'time': sanitize_report_cell(first_present(item, ['time', 'timestamp', 'date', '时间', '日期']) or '未知时间', max_chars=80),
+            'event': sanitize_report_cell(event, max_chars=240),
+            'source': sanitize_report_cell(first_present(item, ['source', 'tool', 'src_ip', '来源', '工具', '源IP']) or f'时间线 {index}', max_chars=120),
+        })
+    return events
+
+
+def normalize_report_iocs(iocs, max_iocs_per_type=50):
+    source = parse_json_like(iocs, {})
+    if isinstance(source.get('iocs'), dict):
+        source = source['iocs']
+    elif isinstance(source.get('data'), dict) and isinstance(source['data'].get('iocs'), dict):
+        source = source['data']['iocs']
+    elif isinstance(source.get('data'), dict):
+        source = source['data']
+    aliases = {
+        'ips': ('ips', 'ip', 'IP', '地址'),
+        'domains': ('domains', 'domain', '域名'),
+        'urls': ('urls', 'url', 'URL', '链接'),
+        'paths': ('paths', 'path', 'files', 'file', '路径', '文件'),
+        'ports': ('ports', 'port', '端口'),
+        'hashes': ('hashes', 'hash', 'md5', 'sha1', 'sha256', '哈希'),
+        'users': ('users', 'user', 'account', 'accounts', '用户', '账号', '账户'),
+        'user_agents': ('user_agents', 'user_agent', 'ua', 'User-Agent', 'UA'),
+    }
+    normalized = {}
+    limit = clamp_int(max_iocs_per_type, 50, minimum=1, maximum=INTERNAL_IOC_LIMIT)
+    for key, names in aliases.items():
+        values = []
+        for name in names:
+            raw = source.get(name) if isinstance(source, dict) else None
+            if raw is None:
+                continue
+            if isinstance(raw, (list, tuple, set)):
+                values.extend(raw)
+            else:
+                values.append(raw)
+        seen = set()
+        limited = []
+        for value in values:
+            text = sanitize_report_cell(value, max_chars=240)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            limited.append(text)
+            if len(limited) >= limit:
+                break
+        normalized[key] = limited
+    return normalized
+
+
+def merge_report_iocs(primary, secondary, limit=INTERNAL_IOC_LIMIT):
+    merged = {}
+    keys = list(dict.fromkeys(list((primary or {}).keys()) + list((secondary or {}).keys())))
+    limit = clamp_int(limit, INTERNAL_IOC_LIMIT, minimum=1, maximum=INTERNAL_IOC_LIMIT)
+    for key in keys:
+        seen = set()
+        values = []
+        for source in (primary or {}, secondary or {}):
+            for value in source.get(key) or []:
+                text = sanitize_report_cell(value, max_chars=240)
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                values.append(text)
+                if len(values) >= limit:
+                    break
+            if len(values) >= limit:
+                break
+        merged[key] = values
+    return merged
+
+
+def merge_report_timeline(primary, secondary, max_events=50):
+    merged = []
+    seen = set()
+    max_events = clamp_int(max_events, 50, minimum=1, maximum=200)
+    for event in list(primary or []) + list(secondary or []):
+        item = {
+            'time': sanitize_report_cell(event.get('time') or event.get('timestamp') or event.get('date') or '未知时间', max_chars=80),
+            'event': sanitize_report_cell(event.get('event') or event.get('description') or event.get('desc') or '事件待复核', max_chars=240),
+            'source': sanitize_report_cell(event.get('source') or event.get('tool') or event.get('src_ip') or 'input', max_chars=120),
+        }
+        key = (item['time'], item['event'], item['source'])
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+        if len(merged) >= max_events:
+            break
+    return merged
+
+
+def first_text_match(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text or '', re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ''
+
+
+def normalize_case_context(case, legacy_content=''):
+    data = parse_json_like(case, {})
+    if not isinstance(data, dict):
+        data = {}
+    return {
+        'title': sanitize_report_cell(data.get('title') or data.get('case') or data.get('name') or data.get('案件名称') or first_text_match(legacy_content, [r'(?:案件名称|案件标题|title|case)\s*[:=：]\s*([^\r\n]+)']) or '', max_chars=160),
+        'target': sanitize_report_cell(data.get('target') or data.get('ip') or data.get('目标') or first_text_match(legacy_content, [r'(?:目标信息|目标|target|ip)\s*[:=：]\s*([^\r\n]+)']) or '', max_chars=240),
+        'system': sanitize_report_cell(data.get('system') or data.get('os') or data.get('系统') or first_text_match(legacy_content, [r'(?:系统信息|操作系统|系统|system|os)\s*[:=：]\s*([^\r\n]+)']) or '', max_chars=160),
+        'webroot': sanitize_report_cell(data.get('webroot') or data.get('web_root') or data.get('Web根目录') or data.get('web根目录') or first_text_match(legacy_content, [r'(?:Web根目录|webroot|web_root)\s*[:=：]\s*([^\r\n]+)']) or '', max_chars=240),
+    }
+
+
+def normalize_answers(answers):
+    data = parse_json_like(answers, {})
+    if isinstance(data, dict) and isinstance(data.get('answers'), dict):
+        return data['answers']
+    if isinstance(data, dict) and isinstance(data.get('data'), dict):
+        return data['data']
+    if isinstance(data, dict) and any(key in data for key in ('status', 'result', 'data', 'error', 'meta')):
+        items = data.get('data') if isinstance(data.get('data'), list) else []
+    elif data:
+        return data
+    else:
+        items = parse_json_like(answers, [])
+    normalized = {}
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, dict):
+            key = first_present(item, ['question', 'item', 'name', 'title', '问题', '题目', '检测项']) or f'答案 {index}'
+            value = first_present(item, ['answer', 'value', 'result', 'finding', 'description', '答案', '结果', '关键发现', '描述']) or ''
+        else:
+            key = f'答案 {index}'
+            value = item
+        if str(key or '').strip() or str(value or '').strip():
+            normalized[str(key or f'答案 {index}')] = value
+    return normalized
+
+
+def format_answers_lines(answers):
+    data = normalize_answers(answers)
+    if not data:
+        return '- 未提供结构化答案。'
+    lines = []
+    for key, value in data.items():
+        lines.append(f'- {sanitize_report_cell(key, max_chars=80)}：{sanitize_report_cell(value, max_chars=240)}')
+    return '\n'.join(lines)
+
+
+def build_answers_tail(answers):
+    return f'## 答案\n\n{format_answers_lines(answers)}'
+
+
+def build_delivery_preview(case_context, legacy_summary, source_note, evidence_status, findings_rows, ioc_text, timeline_text, answers, report_path):
+    title = case_context.get('title') or '未提供'
+    target = case_context.get('target') or '未提供'
+    system = case_context.get('system') or '未提供'
+    webroot = case_context.get('webroot') or '未提供'
+    return f'''## 案件背景
+
+- 案件标题：{title}
+- 目标信息：{target}
+- 系统信息：{system}
+- Web 根目录：{webroot}
+- 证据状态：{evidence_status}
+
+## 摘要
+
+- 材料来源：{source_note}
+
+```text
+{legacy_summary}
+```
+
+## 检测结果表
+
+| 检测项 | 关键发现 | 风险 | 依据 |
+|---|---|---|---|
+{findings_rows}
+
+## IOC 摘要
+
+{ioc_text}
+
+## 时间线摘要
+
+{timeline_text}
+
+## 完整报告
+
+报告已生成：{report_path}
+
+{build_answers_tail(answers)}
+'''
+
+
+def build_attack_source(findings, timeline_events, iocs):
+    lines = ['## findings']
+    for item in findings:
+        if item.get('risk') not in {'高', '中', '低'}:
+            continue
+        lines.append(f'{item["item"]} {item["finding"]} {item["risk"]} {" ".join(item["evidence"])}')
+    lines.append('## timeline')
+    for event in timeline_events:
+        lines.append(f'{event["time"]} {event["event"]} {event["source"]}')
+    lines.append('## iocs')
+    for key, values in iocs.items():
+        if values:
+            lines.append(f'{key}: {", ".join(values)}')
+    return '\n'.join(lines)
+
+
+def build_structured_summary(findings, timeline_events, iocs):
+    lines = []
+    for item in findings[:5]:
+        lines.append(f'- {item["item"]}: {item["finding"]}（{item["risk"]}）')
+    for event in timeline_events[:5]:
+        lines.append(f'- {event["time"]}: {event["event"]}')
+    for key, values in iocs.items():
+        if values:
+            lines.append(f'- {key}: {", ".join(values[:10])}')
+    return '\n'.join(lines) or '已提供结构化输入，但未形成可展示摘要。'
+
+
+def has_public_network_ioc(iocs):
+    for ip in iocs.get('ips') or []:
+        try:
+            address = ipaddress.ip_address(str(ip))
+        except ValueError:
+            continue
+        if not (address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified):
+            return True
+    return any(iocs.get(key) for key in ('domains', 'urls'))
+
+
+def write_report_file(report):
+    report_dir = safe_local_subdir('downloads/reports') / get_time_path()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / 'report.md'
+    index = 2
+    while report_path.exists():
+        report_path = report_dir / f'report_{index}.md'
+        index += 1
+    report_path.write_text(report, encoding='utf-8')
+    return str(report_path)
 
 
 @mcp.tool()
@@ -415,18 +787,16 @@ def analyze_attack_chain(text='', max_stages=8, evidence_limit=3, include_unobse
 
 
 @mcp.tool()
-def generate_report(extra_context='', include_iocs=True, report_profile='standard', focus='', max_summary_chars=1200, max_findings=12, max_timeline_events=50, max_iocs_per_type=50, evidence_limit=3, include_timeline=True, include_next_tools=False):
+def generate_report(extra_context='', case=None, findings=None, timeline=None, iocs=None, answers=None, output_mode='both', include_iocs=True, report_profile='standard', focus='', max_summary_chars=1200, max_findings=12, max_timeline_events=50, max_iocs_per_type=50, evidence_limit=3, include_timeline=True, include_next_tools=False):
     """
-    调查结束前必须调用的最终汇总工具，基于 extra_context 或已有输入材料生成规范化结论报告。任务结束时输出必须附加报告正文。
-    调用：交付结论、结束调查或用户要求总结前必须调用；可用 report_profile/focus 控制报告画像与关注方向。
-    输出：返回包含 banner、案件背景/摘要、检测结果表、IOC、时间线、攻击流程、风险分析、处置原则和 AI 编排说明的报告草稿。
+    调查结束前必须调用的最终汇总工具，优先基于 AI 按模板整理好的 case/findings/timeline/iocs/answers 渲染规范化结论报告。
+    调用：交付结论、结束调查或用户要求总结前必须调用；AI 客户端应先过滤长日志并按模板填充结构化字段，不要把长日志直接塞入 extra_context。
+    推荐模板：case={案件名称/目标/系统/Web根目录}；findings=[{检测项,关键发现,风险,依据}]；timeline=[{时间,事件,来源}]；iocs={IP,域名,URL,路径,端口,哈希,用户,User-Agent}；answers={题号:答案}。
+    输出：默认 output_mode=both，同时返回完整 markdown 并写入报告文件；output_mode=file 仅写入报告文件并返回短预览和 report_path。
     要求：检测结果表字段固定为 | 检测项 | 关键发现 | 风险 | 依据 |；风险等级只能使用 高 / 中 / 低 / 信息 / 未发现明显异常；证据不足时标注 待检测 或 需人工复核，不得编造完整攻击链。
     """
-    content = ioc_source_text(extra_context)
-    has_content = bool(content.strip())
-    if not has_content:
-        content = '未提供 extra_context 或已有工具输出；尚未执行检测或当前上下文没有可汇总证据。'
-
+    legacy_content = ioc_source_text(extra_context)
+    has_legacy_content = bool(legacy_content.strip())
     profiles = {
         'standard': '标准应急报告',
         'executive': '管理层摘要，突出影响、风险和处置优先级',
@@ -436,64 +806,132 @@ def generate_report(extra_context='', include_iocs=True, report_profile='standar
     report_profile = str(report_profile or 'standard').strip().lower()
     if report_profile not in profiles:
         report_profile = 'standard'
+    output_mode = str(output_mode or 'both').strip().lower()
+    if output_mode not in REPORT_OUTPUT_MODES:
+        output_mode = 'both'
     max_summary_chars = clamp_int(max_summary_chars, 1200, minimum=300, maximum=10000)
     max_findings = clamp_int(max_findings, 12, minimum=1, maximum=50)
     max_timeline_events = clamp_int(max_timeline_events, 50, minimum=1, maximum=200)
     max_iocs_per_type = clamp_int(max_iocs_per_type, 50, minimum=1, maximum=500)
     evidence_limit = clamp_int(evidence_limit, 3, minimum=1, maximum=10)
 
-    findings = summarize_input_sections(content, max_sections=max_findings)
-    ioc_extract_limit = INTERNAL_IOC_LIMIT
-    iocs = extract_ioc_values(content, limit=ioc_extract_limit)
-    timeline_events = extract_timeline_events(content, limit=max_timeline_events)
-    attack_flow = infer_attack_flow(content, iocs=iocs, timeline_events=timeline_events, evidence_limit=evidence_limit)
-    ioc_text = format_ioc_lines(iocs, limit=max_iocs_per_type, extraction_limit=ioc_extract_limit) if include_iocs else '未启用 IOC 摘要展示'
+    case_context = normalize_case_context(case, legacy_content)
+    normalized_findings = normalize_findings(findings, evidence_limit=evidence_limit, max_findings=max_findings)
+    timeline_events = normalize_report_timeline(timeline, max_events=max_timeline_events)
+    normalized_iocs = normalize_report_iocs(iocs, max_iocs_per_type=INTERNAL_IOC_LIMIT)
+    normalized_answers = normalize_answers(answers)
+    has_case_context = any(case_context.values())
+    has_structured_evidence = any((normalized_findings, timeline_events, any(normalized_iocs.values())))
+    has_structured_input = any((has_case_context, has_structured_evidence, normalized_answers))
+    structured_summary = build_structured_summary(normalized_findings, timeline_events, normalized_iocs) if has_structured_input else ''
+    if has_legacy_content and structured_summary:
+        legacy_summary_source = legacy_content + '\n' + structured_summary
+    elif has_legacy_content:
+        legacy_summary_source = legacy_content
+    elif structured_summary:
+        legacy_summary_source = structured_summary
+    else:
+        legacy_summary_source = '未提供 extra_context 或结构化证据；尚未执行检测或当前上下文没有可汇总证据。'
+    legacy_summary, summary_truncated = truncate_text(legacy_summary_source, max_chars=max_summary_chars)
+
+    legacy_findings_rows = ''
+    legacy_findings_for_attack = []
+    if has_legacy_content:
+        remaining_findings = max_findings - len(normalized_findings)
+        if remaining_findings > 0:
+            legacy_findings_rows = summarize_input_sections(legacy_content, max_sections=remaining_findings)
+        legacy_findings_for_attack = normalize_findings([
+            {'item': '兼容输入摘要', 'finding': '从 extra_context 生成的兼容检测行', 'risk': infer_risk_level(legacy_content), 'evidence': [legacy_summary]}
+        ], evidence_limit=evidence_limit, max_findings=1)
+    structured_findings_rows = format_findings_rows(normalized_findings) if normalized_findings else ''
+    if structured_findings_rows and legacy_findings_rows:
+        findings_rows = structured_findings_rows + '\n' + legacy_findings_rows
+    elif structured_findings_rows:
+        findings_rows = structured_findings_rows
+    elif legacy_findings_rows:
+        findings_rows = legacy_findings_rows
+    else:
+        findings_rows = format_findings_rows([])
+    findings_for_attack = normalized_findings + legacy_findings_for_attack
+
+    if has_legacy_content:
+        legacy_iocs = extract_ioc_values(legacy_content, limit=INTERNAL_IOC_LIMIT)
+        normalized_iocs = merge_report_iocs(normalized_iocs, legacy_iocs, limit=INTERNAL_IOC_LIMIT)
+        legacy_timeline_events = extract_timeline_events(legacy_content, limit=max_timeline_events)
+        timeline_events = merge_report_timeline(timeline_events, legacy_timeline_events, max_events=max_timeline_events)
+
+    attack_parts = [legacy_content, build_attack_source(findings_for_attack, timeline_events, normalized_iocs)]
+    attack_source = '\n'.join(part for part in attack_parts if part)
+    attack_flow = infer_attack_flow(attack_source, iocs=normalized_iocs, timeline_events=timeline_events, evidence_limit=evidence_limit)
+    ioc_text = format_ioc_lines(normalized_iocs, limit=max_iocs_per_type, extraction_limit=INTERNAL_IOC_LIMIT) if include_iocs else '未启用 IOC 摘要展示'
     timeline_text = format_timeline_lines(timeline_events, limit=min(max_timeline_events, 15)) if include_timeline else '未启用时间线摘要'
-    next_tools = NO_PRESET_NEXT_TOOLS
     has_attack_flow = any(stage['status'] == '发现线索' for stage in attack_flow['stages'])
-    if not has_content:
+    focus_line = f'- 关注方向：{focus}' if str(focus or '').strip() else '- 关注方向：未指定，按通用 Linux 应急响应组织。'
+    title_line = f'- 案件标题：{case_context["title"]}' if case_context['title'] else '- 案件标题：未提供。'
+    target_line = f'- 目标信息：{case_context["target"]}' if case_context['target'] else '- 目标信息：未提供。'
+    system_line = f'- 系统信息：{case_context["system"]}' if case_context['system'] else '- 系统信息：未提供。'
+    webroot_line = f'- Web 根目录：{case_context["webroot"]}' if case_context['webroot'] else '- Web 根目录：未提供。'
+    if has_structured_evidence:
+        evidence_status = '已提供结构化证据，报告按 findings/timeline/iocs 渲染。'
+        source_note = '结构化输入'
+    elif has_structured_input:
+        evidence_status = '待检测：已提供结构化案件或答案信息，但未提供 findings/timeline/iocs 工具证据。'
+        source_note = '结构化案件背景'
+    elif has_legacy_content:
+        evidence_status = '未提供完整结构化证据，已使用 extra_context 兼容摘要；建议后续改为 findings/timeline/iocs。'
+        source_note = 'extra_context 兼容摘要'
+    else:
+        evidence_status = '待检测：未提供 extra_context 或结构化证据。'
+        source_note = '无输入材料'
+    suspicious_findings = any(item['risk'] in {'高', '中'} for item in findings_for_attack)
+    suspicious_attack_flow = any(
+        stage['status'] == '发现线索' and any(not evidence.startswith('IOC: ') for evidence in stage.get('evidence', []))
+        for stage in attack_flow['stages']
+    )
+    if not has_structured_evidence and not has_legacy_content:
         risk_note = '未提供可汇总的工具证据，不能判断是否存在入侵、WebShell、持久化或影响动作；所有结论均应标注为待检测或需人工复核。'
-    elif any(iocs.values()) or '[!]' in content or has_attack_flow:
+    elif suspicious_findings or suspicious_attack_flow or has_public_network_ioc(normalized_iocs) or '[!]' in legacy_content:
         risk_note = '发现可疑线索，需结合原始日志和业务上下文人工复核。'
     else:
-        risk_note = '当前摘要未提取到明确 IOC 或攻击阶段证据，仍需结合工具失败、权限不足和截断情况复核。'
-    summary, truncated = truncate_text(content, max_chars=max_summary_chars)
-    truncated_note = '；报告摘要已截断' if truncated else ''
-    focus_line = f'- 关注方向：{focus}' if str(focus or '').strip() else '- 关注方向：未指定，按通用 Linux 应急响应组织。'
-    background_line = '- 案件背景：来自用户输入、题目信息、目标信息或已执行 MCP 工具输出。' if has_content else '- 案件背景：未提供可汇总材料；任务背景、目标信息和工具证据均待补充。'
-    evidence_status = '已提供输入材料，以下结论仅基于当前材料。' if has_content else '待检测：未提供 extra_context 或可汇总工具输出。'
+        risk_note = '当前结构化摘要未见明确高危线索，仍需结合工具失败、权限不足和截断情况复核。'
+    truncated_note = '；摘要已截断，完整原始材料未写入报告正文' if summary_truncated else ''
+    next_tools = NO_PRESET_NEXT_TOOLS
 
-    return f'''```text
+    report = f'''```text
 {AUTOIR_MCP_BANNER}
 ```
 
 ## 案件背景
 
-{background_line}
+{title_line}
+{target_line}
+{system_line}
+{webroot_line}
 {focus_line}
 - 报告画像：{report_profile}（{profiles[report_profile]}）
 - 证据状态：{evidence_status}
 
 ## 摘要
 
-- 材料来源：extra_context / 工具输出{truncated_note}
+- 材料来源：{source_note}{truncated_note}
 - 关键摘要：
 
 ```text
-{summary}
+{legacy_summary}
 ```
 
 ## 检测结果表
 
 | 检测项 | 关键发现 | 风险 | 依据 |
 |---|---|---|---|
-{findings}
+{findings_rows}
 
 ## 检测状态说明
 
 - 未发现明显异常：仅表示当前材料未见明确异常，不代表目标绝对安全。
 - 检测失败 / 权限不足 / 输出截断：必须按工具原始结果呈现，不能归类为无异常。
 - 待检测 / 需人工复核：表示当前证据不足，不能编造结论。
+- 结构化输入优先：长日志应先过滤、切片并整理为 findings/timeline/iocs 后再生成报告。
 
 ## IOC 摘要
 
@@ -502,6 +940,10 @@ def generate_report(extra_context='', include_iocs=True, report_profile='standar
 ## 时间线摘要
 
 {timeline_text}
+
+## 结构化答案
+
+{format_answers_lines(answers)}
 
 ## 攻击流程分析
 
@@ -525,6 +967,26 @@ def generate_report(extra_context='', include_iocs=True, report_profile='standar
 
 {next_tools}
 '''
+    preview, preview_truncated = truncate_text(report, max_chars=max_summary_chars)
+    if output_mode == 'inline':
+        return report
+    if output_mode == 'preview':
+        return {'status': True, 'result': preview, 'report_path': '', 'truncated': preview_truncated}
+    report_path = write_report_file(report)
+    delivery = build_delivery_preview(
+        case_context,
+        legacy_summary,
+        source_note,
+        evidence_status,
+        findings_rows,
+        ioc_text,
+        timeline_text,
+        answers,
+        report_path,
+    )
+    if output_mode == 'both':
+        return {'status': True, 'result': report, 'preview': delivery, 'report_path': report_path, 'truncated': preview_truncated}
+    return {'status': True, 'result': delivery, 'report_path': report_path, 'truncated': preview_truncated}
 
 
 def command_format(check, command):
