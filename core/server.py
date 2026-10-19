@@ -29,6 +29,7 @@ from .prompts import AUTOIR_MCP_BANNER, MCP_INSTRUCTIONS, TOOL_CATEGORIES
 from .session import SSHSession
 import paramiko
 import csv
+import datetime
 import json
 import os
 import shutil
@@ -157,6 +158,9 @@ def get_ssh_client(ip, port=22, username='root', password='', verify_host_key=Fa
         with session_lock:
             old_client = ssh_session.client if ssh_session and ssh_session.client else None
             ssh_session = SSHSession(client)
+            ssh_session.target_ip = ip
+            ssh_session.target_port = port
+            ssh_session.target_username = username
         _close_client(old_client)
         result_text = "SSH 连接成功"
         if not verify_host_key:
@@ -1806,6 +1810,232 @@ def check_kernel_modules():
         output.append(f'module: {name}\tsize: {size}\tused: {used}\tpath: {path or "-"}\t{tag}')
 
     return append_warnings('\n'.join(output) or empty_result('未发现已加载内核模块'), warnings)
+
+
+def ebpf_kernel_finding(line):
+    """Return a finding tag for kernel/eBPF related log lines."""
+    lower = (line or '').lower()
+    if re.search(r'\b(?:kernel bug|bug:|oops|call trace|general protection fault|'
+                 r'unable to handle kernel)', lower):
+        return '[!] 内核异常/Oops 线索，需重点复核'
+    if 'module verification failed' in lower or 'key was rejected' in lower:
+        return '[!] 内核模块签名/校验失败'
+    if 'loading out-of-tree module taints kernel' in lower:
+        return '[i] 加载树外模块'
+    if 'bpf' in lower and re.search(r'\b(?:jited|prog|map|verifier|attach)\b', lower):
+        return '[i] eBPF 相关内核日志，需结合已加载程序复核'
+    if 'taint' in lower:
+        return '[i] 内核 taint 变化，需结合 taint 位复核'
+    return None
+
+
+@mcp.tool()
+def check_ebpf():
+    """
+    检查 eBPF 程序、映射、pinned 对象和内核 BPF 相关日志。
+    调用：排查 eBPF rootkit、隐藏 hook、非授权跟踪程序或内核异常时使用。
+    输出：返回 bpftool 枚举、/sys/fs/bpf 对象、非特权 BPF 配置、内核日志命中；bpftool 缺失或权限不足时明确标注。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    nonce = get_run_id()
+    prog_mark = f'@@AUTOIR_EBPF:{nonce}:PROG@@'
+    map_mark = f'@@AUTOIR_EBPF:{nonce}:MAP@@'
+    net_mark = f'@@AUTOIR_EBPF:{nonce}:NET@@'
+    cgroup_mark = f'@@AUTOIR_EBPF:{nonce}:CGROUP@@'
+    pinned_mark = f'@@AUTOIR_EBPF:{nonce}:PINNED@@'
+    sysctl_mark = f'@@AUTOIR_EBPF:{nonce}:SYSCTL@@'
+    dmesg_mark = f'@@AUTOIR_EBPF:{nonce}:DMESG@@'
+    command = (
+        f"printf '{prog_mark}\\n'; "
+        "if command -v bpftool >/dev/null 2>&1; then bpftool prog list 2>&1 | head -n 200; "
+        "else echo 'bpftool unavailable'; fi; "
+        f"printf '\\n{map_mark}\\n'; "
+        "if command -v bpftool >/dev/null 2>&1; then bpftool map list 2>&1 | head -n 120; fi; "
+        f"printf '\\n{net_mark}\\n'; "
+        "if command -v bpftool >/dev/null 2>&1; then bpftool net list 2>&1 | head -n 80; fi; "
+        f"printf '\\n{cgroup_mark}\\n'; "
+        "if command -v bpftool >/dev/null 2>&1; then bpftool cgroup tree 2>&1 | head -n 80; fi; "
+        f"printf '\\n{pinned_mark}\\n'; "
+        "if [ -d /sys/fs/bpf ]; then find /sys/fs/bpf -type f 2>/dev/null | head -n 100; fi; "
+        f"printf '\\n{sysctl_mark}\\n'; "
+        "cat /proc/sys/kernel/unprivileged_bpf_disabled 2>&1; "
+        f"printf '\\n{dmesg_mark}\\n'; "
+        "(dmesg 2>/dev/null || journalctl -k -n 2000 --no-pager 2>/dev/null) | "
+        "grep -Ei 'bpf|oops|BUG:|taint|module verification|out-of-tree|"
+        "general protection|unable to handle' | tail -n 200"
+    )
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=400000)
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, 'eBPF/内核可观测性检查失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] eBPF 输出超过采集上限，结果可能不完整')
+
+    _, _, current = text.partition(prog_mark)
+    prog_text, _, current = current.partition(map_mark)
+    map_text, _, current = current.partition(net_mark)
+    net_text, _, current = current.partition(cgroup_mark)
+    cgroup_text, _, current = current.partition(pinned_mark)
+    pinned_text, _, current = current.partition(sysctl_mark)
+    sysctl_text, _, dmesg_text = current.partition(dmesg_mark)
+
+    output = []
+    bpftool_missing = 'bpftool unavailable' in prog_text
+    if bpftool_missing:
+        output.append('[i] bpftool 未安装，无法枚举 eBPF 程序和映射')
+    else:
+        prog_lines = [line for line in prog_text.splitlines() if line.strip()]
+        if prog_lines:
+            output.append(f'[i] bpftool prog list 返回 {len(prog_lines)} 行')
+            output.extend(f'\t{line[:300]}' for line in prog_lines[:80])
+        else:
+            output.append('[i] bpftool 未返回 eBPF 程序')
+        map_lines = [line for line in map_text.splitlines() if line.strip()]
+        if map_lines:
+            output.append(f'[i] bpftool map list 返回 {len(map_lines)} 行（前 60 行）')
+            output.extend(f'\t{line[:300]}' for line in map_lines[:60])
+        net_lines = [line for line in net_text.splitlines() if line.strip()]
+        if net_lines:
+            output.append('[i] bpftool net list')
+            output.extend(f'\t{line[:300]}' for line in net_lines[:40])
+        cgroup_lines = [line for line in cgroup_text.splitlines() if line.strip()]
+        if cgroup_lines:
+            output.append('[i] bpftool cgroup tree（前 40 行）')
+            output.extend(f'\t{line[:300]}' for line in cgroup_lines[:40])
+
+    pinned_lines = [line.strip() for line in pinned_text.splitlines() if line.strip()]
+    if pinned_lines:
+        output.append(f'[i] /sys/fs/bpf 下发现 {len(pinned_lines)} 个 pinned 对象，需核对 Cilium/Falco 等合法组件')
+        output.extend(f'\tpinned: {line}' for line in pinned_lines[:50])
+
+    sysctl_value = sysctl_text.strip().splitlines()[0].strip() if sysctl_text.strip() else ''
+    if sysctl_value == '0':
+        output.append('[!] kernel.unprivileged_bpf_disabled=0，允许非特权用户加载 eBPF，存在滥用风险')
+    elif sysctl_value in ('1', '2'):
+        output.append(f'[i] kernel.unprivileged_bpf_disabled={sysctl_value}')
+    elif sysctl_value:
+        output.append(f'[i] 非特权 BPF 配置读取结果: {sysctl_value[:200]}')
+
+    dmesg_lines = [line for line in dmesg_text.splitlines() if line.strip()]
+    dmesg_hits = []
+    for line in dmesg_lines:
+        finding = ebpf_kernel_finding(line)
+        if finding:
+            dmesg_hits.append(f'\t{line[:300]}\t{finding}')
+    if dmesg_hits:
+        output.append('内核日志命中')
+        output.extend(dmesg_hits[:60])
+        if len(dmesg_hits) > 60:
+            output.append(f'[TRUNCATED] 另有 {len(dmesg_hits) - 60} 条内核日志命中未展示')
+    elif not dmesg_lines:
+        warnings.append('[PERMISSION] dmesg/journal 内核日志不可读，需 root 或调整 kernel.dmesg_restrict 后复核')
+    else:
+        output.append('[i] 内核日志未命中 BPF/Oops/模块校验相关特征')
+
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
+
+
+def memory_map_finding(perms, path):
+    """Classify one /proc/<pid>/maps executable mapping."""
+    perms = perms or ''
+    path = (path or '').strip()
+    if 'w' in perms and 'x' in perms:
+        return '[!] 可写且可执行的内存映射，可能存在代码注入或 JIT'
+    if path.startswith(('/tmp/', '/var/tmp/', '/dev/shm/')):
+        return '[!] 临时目录文件映射为可执行，需重点复核'
+    if path.endswith('(deleted)'):
+        return '[!] 已删除文件仍映射为可执行，可能存在无文件落地/自删除'
+    if path.startswith('/memfd:') or '/memfd:' in path:
+        return '[!] memfd 可执行映射，需结合进程命令行复核'
+    if not path or path.startswith('['):
+        return '[i] 匿名可执行映射，需结合进程与映射内容复核'
+    return None
+
+
+@mcp.tool()
+def check_memory_maps(max_processes=300, max_findings=200):
+    """
+    检查进程内存映射中的可执行异常线索。
+    调用：排查无文件落地、memfd 执行、已删除文件运行、可写可执行内存或进程注入时使用。
+    输出：返回 PID、命令行、映射权限、地址和路径；依赖 /proc 可读性，非 root 会明确标注。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+    try:
+        max_processes = int(max_processes)
+        max_findings = int(max_findings)
+    except (TypeError, ValueError):
+        max_processes, max_findings = 300, 200
+    max_processes = max(10, min(max_processes, 2000))
+    max_findings = max(10, min(max_findings, 1000))
+
+    nonce = get_run_id()
+    uid_mark = f'@@AUTOIR_MMAP:{nonce}:UID@@'
+    command = (
+        f"printf '{uid_mark}\\n'; id -u 2>/dev/null || echo unknown; "
+        "awk -v limit=" + str(max_processes) + " '\n"
+        'FILENAME != current { current=FILENAME; count++; if (count > limit) exit }\n'
+        '$2 ~ /x/ {\n'
+        '  path=$6; for (i=7; i<=NF; i++) path=path" "$i;\n'
+        '  if (path=="" || $2 ~ /w/ || path ~ /^\\/(tmp|var\\/tmp|dev\\/shm)\\// || '
+        'path ~ /\\(deleted\\)$/ || path ~ /^\\/memfd:/) {\n'
+        '    f=FILENAME; sub("^/proc/","",f); sub("/maps$","",f);\n'
+        '    printf "%s\\t%s\\t%s\\t%s\\n", f, $2, $1, path;\n'
+        '  }\n'
+        '}\n'
+        "' /proc/[0-9]*/maps 2>/dev/null | head -n " + str(max_findings) + " | "
+        "while IFS=\"$(printf '\\t')\" read -r pid perms addr path; do "
+        'cmd=$(tr "\\0" " " < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-160); '
+        '[ -n "$cmd" ] || cmd=$(cat "/proc/$pid/comm" 2>/dev/null); '
+        "printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$pid\" \"$cmd\" \"$perms\" \"$addr\" \"$path\"; "
+        'done'
+    )
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=500000)
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, '进程内存映射读取失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 内存映射输出超过采集上限，结果可能不完整')
+    uid_text, _, rows_text = text.partition(uid_mark)
+    uid_text, _, rows_text = rows_text.partition('\n')
+    uid_value = uid_text.strip()
+    if uid_value and uid_value != '0':
+        warnings.append(f'[WARN] 当前 UID 为 {uid_value}，仅能查看部分进程内存映射，需 root 复核')
+
+    if 'awk: not found' in text or 'awk: inaccessible' in text:
+        return append_warnings('[FAILED] awk 不可用，无法解析内存映射', warnings)
+
+    output = []
+    hits = 0
+    for line in rows_text.splitlines():
+        parts = line.split('\t')
+        if len(parts) < 5:
+            continue
+        pid, cmd, perms, addr, path = parts[:5]
+        finding = memory_map_finding(perms, path)
+        if not finding:
+            continue
+        hits += 1
+        output.append(
+            f'pid: {pid}\tcmd: {cmd or "-"}\tperms: {perms}\taddr: {addr}\t'
+            f'path: {path or "[anonymous]"}\t{finding}'
+        )
+        if hits >= max_findings:
+            break
+
+    if not output:
+        return append_warnings(empty_result('未发现异常内存映射'), warnings)
+    if len(rows_text.splitlines()) >= max_findings:
+        warnings.append(f'[TRUNCATED] 内存映射命中达到上限 {max_findings}，可能仍有遗漏')
+    return append_warnings('\n'.join(output), warnings)
 
 
 privilege_escalation = ['aa-exec', 'aoss', 'apt-get', 'apt', 'ash', 'at', 'awk',
@@ -4081,6 +4311,464 @@ def check_login_sessions():
     return append_warnings('\n'.join(output), warnings)
 
 
+AUDIT_EXTRA_PATTERNS = (
+    (re.compile(r'/etc/(?:shadow|gshadow)\b'), '访问敏感凭据文件'),
+    (re.compile(
+        r'(?:^|[;&|]\s*)(?:rm|shred|truncate|unlink)\b[^|;]*'
+        r'(?:/var/log|/var/run/utmp|wtmp|btmp|audit\.log|lastlog)',
+        re.I,
+    ), '删除或清空日志/登录记录'),
+    (re.compile(r'>\s*/var/log/', re.I), '重定向覆盖日志'),
+    (re.compile(
+        r'\b(?:systemctl|service)\s+(?:stop|disable|mask)\s+'
+        r'(?:auditd|rsyslog|syslog|systemd-journald)',
+        re.I,
+    ), '停止审计/日志服务'),
+    (re.compile(
+        r'\b(?:docker|podman)\b[^|;]*(?:--privileged|docker\.sock|containerd\.sock)',
+        re.I,
+    ), '特权容器/容器运行时套接字访问'),
+    (re.compile(r'\b(?:chattr|setfattr)\b', re.I), '文件属性变更'),
+    (re.compile(r'\b(?:insmod|modprobe)\b', re.I), '内核模块加载'),
+)
+
+
+def decode_audit_proctitle(value):
+    """Decode the hex-encoded NUL-separated proctitle field used by auditd."""
+    value = (value or '').strip()
+    if not value or len(value) % 2 or not re.fullmatch(r'[0-9A-Fa-f]+', value):
+        return ''
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        return ''
+    return ' '.join(part.decode('utf-8', 'replace') for part in raw.split(b'\0') if part)
+
+
+def _decode_audit_value(quoted, hex_value):
+    if quoted is not None:
+        return quoted.replace('\\"', '"')
+    try:
+        return bytes.fromhex(hex_value).decode('utf-8', 'replace')
+    except ValueError:
+        return hex_value
+
+
+def audit_command(line):
+    """Extract a readable command from an auditd PROCTITLE, EXECVE or USER_CMD line."""
+    match = re.search(r'\bproctitle=([0-9A-Fa-f]+)', line)
+    if match:
+        command = decode_audit_proctitle(match.group(1))
+        if command:
+            return command
+    if 'type=EXECVE' in line:
+        arguments = [
+            _decode_audit_value(quoted, hex_value)
+            for quoted, hex_value in re.findall(
+                r'\ba\d+=(?:"((?:[^"\\]|\\.)*)"|([0-9A-Fa-f]+))', line
+            )
+        ]
+        if arguments:
+            return ' '.join(arguments)
+    match = re.search(r'\bcmd=(?:"((?:[^"\\]|\\.)*)"|([0-9A-Fa-f]+))', line)
+    if match:
+        return _decode_audit_value(*match.groups())
+    return ''
+
+
+def audit_timestamp(line):
+    """Convert the audit(epoch:serial) timestamp to local readable time."""
+    match = re.search(r'\baudit\((\d+(?:\.\d+)?):', line)
+    if not match:
+        return ''
+    try:
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(match.group(1))))
+    except (ValueError, OSError, OverflowError):
+        return ''
+
+
+def audit_line_finding(line):
+    """Return an evidence tag for one audit.log line, or None."""
+    if 'type=DAEMON_ABORT' in line or 'type=DAEMON_END' in line:
+        return '[!] auditd 守护进程异常结束，日志可能中断，需重点复核'
+    if 'type=AVC' in line and 'denied' in line:
+        return '[i] SELinux/AppArmor 拒绝事件（AVC denied）'
+    if 'type=CONFIG_CHANGE' in line:
+        if 'auid=4294967295' in line or 'auid=unset' in line:
+            return '[!] 审计规则变更来源不明确（auid unset），需重点复核'
+        return '[i] 审计规则/配置发生变更，需核对是否为管理员操作'
+    if 'type=USER_LOGIN' in line and 'res=failed' in line:
+        return '[i] 用户登录失败事件'
+    if 'type=USER_AUTH' in line and 'res=failed' in line:
+        return '[i] 用户认证失败事件'
+    exe_match = re.search(r'\bexe="([^"]+)"', line)
+    if exe_match and re.match(r'^/(?:tmp|var/tmp|dev/shm)/', exe_match.group(1)):
+        return '[!] 从临时目录执行程序'
+    command = audit_command(line)
+    if command:
+        reason = history_suspicious_reason(command)
+        if reason:
+            tag = '[i]' if reason in LOW_SIGNAL_HISTORY_REASONS else '[!]'
+            return f'{tag} 审计命令特征（{reason}）: {command[:200]}'
+        for pattern, pattern_reason in AUDIT_EXTRA_PATTERNS:
+            if pattern.search(command):
+                return f'[!] {pattern_reason}: {command[:200]}'
+    return None
+
+
+@mcp.tool()
+def check_auditd(max_lines=5000):
+    """
+    检查 auditd 审计规则、守护进程状态和审计事件。
+    调用：需要还原命令执行、文件访问、提权、审计规则变更或日志中断时使用。
+    输出：返回 auditctl 规则、auditd 状态和命中的 EXECVE/AVC/CONFIG_CHANGE 等事件；审计未启用时明确标注。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+    try:
+        max_lines = int(max_lines)
+    except (TypeError, ValueError):
+        max_lines = 5000
+    max_lines = max(100, min(max_lines, 20000))
+
+    nonce = get_run_id()
+    rules_mark = f'@@AUTOIR_AUDIT:{nonce}:RULES@@'
+    log_mark = f'@@AUTOIR_AUDIT:{nonce}:LOG@@'
+    command = (
+        f"printf '{rules_mark}\\n'; "
+        "if command -v auditctl >/dev/null 2>&1; then auditctl -l 2>&1 | head -n 200; "
+        "else echo 'auditctl not found'; fi; "
+        "if command -v systemctl >/dev/null 2>&1; then "
+        "printf 'auditd_state='; systemctl is-active auditd 2>/dev/null || true; fi; "
+        f"printf '\\n{log_mark}\\n'; "
+        "if [ -r /var/log/audit/audit.log ]; then "
+        f"tail -n {max_lines} /var/log/audit/audit.log; "
+        "elif command -v ausearch >/dev/null 2>&1; then "
+        "ausearch -ts recent -m EXECVE,SYSCALL,USER_CMD,USER_LOGIN,USER_AUTH,AVC,"
+        f"CONFIG_CHANGE,DAEMON_END,DAEMON_ABORT 2>/dev/null | tail -n {max_lines}; "
+        "elif command -v journalctl >/dev/null 2>&1; then "
+        f"journalctl -n {max_lines} --no-pager 2>/dev/null | "
+        "grep -E 'type=(EXECVE|SYSCALL|USER_CMD|USER_LOGIN|USER_AUTH|AVC|CONFIG_CHANGE|"
+        "DAEMON_END|DAEMON_ABORT)' || true; "
+        "else echo '@@AUTOIR_AUDIT_NO_SOURCE@@'; fi"
+    )
+    result = exec_command(ssh_session.client, command, timeout=45, max_bytes=600000)
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, '审计日志读取失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 审计日志输出超过采集上限，事件可能不完整')
+    if 'permission denied' in text.lower():
+        warnings.append('[PERMISSION] 审计日志或 auditctl 权限不足，需使用 root 复核')
+
+    rules_text, _, log_text = text.partition(log_mark)
+    rules_text = rules_text.partition(rules_mark)[2]
+    output = []
+
+    state_match = re.search(r'auditd_state=(\S+)', rules_text)
+    if state_match:
+        state = state_match.group(1)
+        output.append(
+            f'[i] auditd 状态: {state}'
+            + ('（未运行，实时审计可能缺失）' if state not in ('active',) else '')
+        )
+    rule_lines = [
+        line.strip() for line in rules_text.splitlines()
+        if line.strip() and not line.startswith('auditd_state=') and line.strip() != 'auditctl not found'
+    ]
+    if rule_lines:
+        output.append('审计规则（auditctl -l）')
+        output.extend(f'\t{line}' for line in rule_lines[:100])
+        if any('no rules' in line.lower() for line in rule_lines):
+            output.append('[i] 未配置审计规则，EXECVE 等命令执行事件可能缺失')
+    else:
+        output.append('[i] 未读取到 auditctl 规则，auditd 可能未安装或未启用')
+
+    event_lines = [line for line in log_text.splitlines() if line.strip()]
+    if '@@AUTOIR_AUDIT_NO_SOURCE@@' in log_text:
+        output.append('[NOT_FOUND] 未发现 auditd 日志，auditd 可能未安装、未启用或不可读')
+        return append_warnings('\n'.join(output), warnings)
+    if not event_lines:
+        output.append('[i] 审计日志可读，但最近未返回事件（可能为空、已轮转或 auditd 未记录）')
+        return append_warnings('\n'.join(output), warnings)
+
+    findings = []
+    seen = set()
+    avc_count = 0
+    failed_auth = 0
+    for line in event_lines:
+        if 'type=AVC' in line and 'denied' in line:
+            avc_count += 1
+        if ('type=USER_LOGIN' in line or 'type=USER_AUTH' in line) and 'res=failed' in line:
+            failed_auth += 1
+        finding = audit_line_finding(line)
+        if not finding:
+            continue
+        command = audit_command(line)
+        key = (finding, command)
+        if key in seen:
+            continue
+        seen.add(key)
+        timestamp = audit_timestamp(line)
+        findings.append(f'\t{timestamp + "  " if timestamp else ""}{finding}')
+
+    output.append(f'[i] 已分析审计事件 {len(event_lines)} 行，命中 {len(findings)} 条高危/关注特征')
+    if findings:
+        output.append('审计事件命中')
+        output.extend(findings[:60])
+        if len(findings) > 60:
+            output.append(f'[TRUNCATED] 另有 {len(findings) - 60} 条命中未展示')
+    else:
+        output.append('[i] 审计日志中未命中高危命令特征，仍需结合时间线人工复核')
+    if avc_count:
+        output.append(f'[i] AVC denied 事件: {avc_count} 条（SELinux/AppArmor 拒绝）')
+    if failed_auth:
+        output.append(f'[i] 认证失败事件: {failed_auth} 条')
+    return append_warnings('\n'.join(output), warnings)
+
+
+SYSLOG_TS_PATTERN = re.compile(
+    r'^(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+'
+    r'(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})'
+)
+ISO_TS_PATTERN = re.compile(
+    r'^(?P<year>\d{4})-(?P<mon>\d{2})-(?P<day>\d{2})[T ]'
+    r'(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})'
+)
+SYSLOG_MONTHS = {
+    name: index for index, name in enumerate(
+        ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+         'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'),
+        1,
+    )
+}
+
+
+def parse_log_timestamp(line):
+    """Parse common syslog/ISO timestamps. Returns (datetime, has_year)."""
+    match = ISO_TS_PATTERN.match(line)
+    if match:
+        try:
+            return datetime.datetime(
+                int(match.group('year')), int(match.group('mon')), int(match.group('day')),
+                int(match.group('hour')), int(match.group('minute')), int(match.group('second')),
+            ), True
+        except ValueError:
+            return None, False
+    match = SYSLOG_TS_PATTERN.match(line)
+    if match:
+        month = SYSLOG_MONTHS.get(match.group('mon'))
+        if month is None:
+            return None, False
+        try:
+            return datetime.datetime(
+                datetime.datetime.now().year, month, int(match.group('day')),
+                int(match.group('hour')), int(match.group('minute')), int(match.group('second')),
+            ), False
+        except ValueError:
+            return None, False
+    return None, False
+
+
+def log_timestamp_gaps(lines, threshold_seconds=86400, limit=10):
+    """Return timestamp gaps in a log, flagging likely rotated/cleared windows."""
+    parsed = []
+    for line in lines:
+        timestamp, has_year = parse_log_timestamp(line)
+        if timestamp is not None:
+            parsed.append((timestamp, has_year))
+    gaps = []
+    for (previous, _), (current, has_year) in zip(parsed, parsed[1:]):
+        if current < previous:
+            if has_year:
+                continue
+            # Only treat a backwards jump as a year rollover around Dec/Jan;
+            # otherwise it is an out-of-order or clock-changed line.
+            if previous.month >= 11 and current.month <= 2:
+                current = current.replace(year=current.year + 1)
+            else:
+                continue
+        seconds = (current - previous).total_seconds()
+        if seconds >= threshold_seconds:
+            gaps.append({'start': previous, 'end': current, 'seconds': seconds})
+            if len(gaps) >= limit:
+                break
+    return gaps
+
+
+@mcp.tool()
+def check_log_integrity():
+    """
+    检查登录审计文件、系统日志和 journal 的完整性与连续性。
+    调用：怀疑日志被清空、篡改、轮转异常或登录记录缺失时使用。
+    输出：返回日志文件大小/权限/时间、journal 校验结果、认证日志时间断层和 logrotate 可疑配置。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    nonce = get_run_id()
+    stat_mark = f'@@AUTOIR_LOGINT:{nonce}:STAT@@'
+    auth_mark = f'@@AUTOIR_LOGINT:{nonce}:AUTH@@'
+    command = (
+        f"printf '{stat_mark}\\n'; "
+        "for f in /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/faillog "
+        "/var/run/utmp /var/log/audit/audit.log /var/log/auth.log /var/log/secure "
+        "/var/log/syslog /var/log/messages; do "
+        "if [ -e \"$f\" ]; then "
+        "stat -c '%n|%s|%A|%U:%G|%y' \"$f\" 2>/dev/null || ls -ln \"$f\" 2>/dev/null; "
+        "else echo \"MISSING|$f\"; fi; done; "
+        f"printf '\\n{auth_mark}\\n'; "
+        "(cat /var/log/auth.log 2>/dev/null || cat /var/log/secure 2>/dev/null || "
+        "journalctl -n 5000 --no-pager 2>/dev/null) | tail -n 5000"
+    )
+    result = exec_command(ssh_session.client, command, timeout=45, max_bytes=600000)
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, '日志完整性信息读取失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 日志完整性输出超过采集上限，结果可能不完整')
+
+    stat_text, _, auth_text = text.partition(auth_mark)
+    stat_text = stat_text.partition(stat_mark)[2]
+
+    # journal 校验单独执行，避免大 journal 校验超时导致文件状态和认证日志结果一起丢失。
+    journal_result = exec_command(
+        ssh_session.client,
+        "if command -v journalctl >/dev/null 2>&1; then "
+        "echo '--- verify ---'; journalctl --verify 2>&1 | tail -n 20; "
+        "echo '--- boots ---'; journalctl --list-boots --no-pager 2>/dev/null | tail -n 8; "
+        "else echo 'journalctl not found'; fi",
+        timeout=60,
+        max_bytes=50000,
+    )
+    journal_text = journal_result.get('result') or ''
+    if journal_result.get('truncated'):
+        warnings.append('[TRUNCATED] journal 校验输出超过采集上限')
+
+    output = ['日志文件状态']
+    for line in stat_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith('MISSING|'):
+            path = line.split('|', 1)[1]
+            name = os.path.basename(path)
+            if name == 'wtmp':
+                output.append(f'[!] 关键登录审计文件缺失: {path}')
+            elif name == 'btmp':
+                output.append(f'[i] 失败登录记录文件不存在: {path}（可能未启用或已被删除）')
+            else:
+                output.append(f'[i] 日志文件不存在: {path}')
+            continue
+        parts = line.split('|')
+        if len(parts) < 5:
+            output.append(f'\t{line}')
+            continue
+        path, size, mode, owner, mtime = parts[:5]
+        name = os.path.basename(path)
+        finding = ''
+        if size == '0':
+            if name in ('auth.log', 'secure', 'syslog', 'messages', 'audit.log', 'utmp'):
+                finding = '[!] 日志文件大小为 0，可能被清空或未写入'
+            elif name in ('wtmp', 'btmp', 'lastlog', 'faillog'):
+                finding = '[i] 登录审计文件为空，需结合轮转周期复核'
+        elif len(mode) >= 9 and mode[8] == 'w':
+            finding = '[!] 日志文件全局可写，存在被篡改风险'
+        output.append(f'\t{path}\tsize: {size}\tmode: {mode}\towner: {owner}\tmtime: {mtime}'
+                      + (f'\t{finding}' if finding else ''))
+
+    journal_lines = [line.strip() for line in journal_text.splitlines() if line.strip()]
+    if journal_lines and not all(line == 'journalctl not found' for line in journal_lines):
+        output.append('\njournal 完整性')
+        verify_lines = []
+        reported = False
+        for line in journal_lines:
+            lower = line.lower()
+            if 'fail' in lower or 'corrupt' in lower or 'error' in lower:
+                output.append(f'[!] journal 校验异常: {line[:300]}')
+                reported = True
+            elif 'pass' in lower:
+                verify_lines.append(line)
+        if verify_lines:
+            output.append(f'[i] journal 校验通过 {len(verify_lines)} 项')
+            reported = True
+        boot_lines = []
+        in_boots = False
+        for line in journal_lines:
+            if line == '--- boots ---':
+                in_boots = True
+                continue
+            if line == '--- verify ---':
+                in_boots = False
+                continue
+            if in_boots:
+                boot_lines.append(line)
+        if boot_lines:
+            output.append('[i] journal boot 记录（最近 8 条）')
+            output.extend(f'\t{line}' for line in boot_lines[:8])
+            reported = True
+        if not reported:
+            output.append(f'[FAILED] journal 校验无有效结果: {journal_lines[-1][:300]}')
+    elif journal_result.get('status') is False:
+        output.append(
+            f"[FAILED] journal 完整性校验失败或超时: "
+            f"{journal_result.get('error') or '无输出'}"
+        )
+    else:
+        output.append('[i] journalctl 不可用，无法校验 journal 完整性')
+
+    auth_lines = auth_text.splitlines()
+    if auth_lines:
+        gaps = log_timestamp_gaps(auth_lines, threshold_seconds=86400, limit=5)
+        if gaps:
+            output.append('\n认证日志时间断层')
+            for gap in gaps:
+                hours = gap['seconds'] / 3600
+                output.append(
+                    f"[!] {gap['start'].strftime('%Y-%m-%d %H:%M:%S')} -> "
+                    f"{gap['end'].strftime('%Y-%m-%d %H:%M:%S')} 约 {hours:.1f} 小时无记录，"
+                    '可能存在日志清理、轮转缺失或采集中断'
+                )
+        else:
+            output.append('[i] 认证日志未发现超过 24 小时的时间断层')
+    else:
+        output.append('[i] 未读取到认证日志内容，可能日志后端为 journal 或路径不同')
+
+    rotate_paths = ['/etc/logrotate.conf']
+    for name in get_files('/etc/logrotate.d', warnings=warnings):
+        if name not in ('.', '..'):
+            rotate_paths.append(f'/etc/logrotate.d/{name}')
+    rotate_hits = []
+    for entry in read_remote_files(rotate_paths, warnings=warnings):
+        if entry['status'] != 'ok':
+            continue
+        for line_number, line in enumerate(entry['content'].splitlines(), 1):
+            candidate = line.strip()
+            if not candidate or candidate.startswith('#'):
+                continue
+            reason = history_suspicious_reason(candidate)
+            if not reason and check_safe_local(candidate):
+                reason = '本地命令执行特征'
+            if reason:
+                rotate_hits.append(
+                    f'[!] logrotate 可疑配置 {entry["path"]}:{line_number}: '
+                    f'{candidate[:200]}（{reason}）'
+                )
+    if rotate_hits:
+        output.append('\nlogrotate 配置')
+        output.extend(rotate_hits[:20])
+        if len(rotate_hits) > 20:
+            output.append(f'[TRUNCATED] 另有 {len(rotate_hits) - 20} 条配置命中未展示')
+
+    return append_warnings('\n'.join(output), warnings)
+
+
 def _rootkit_upload_impl(install=False):
     if not check_session():
         return SESSION_ERROR
@@ -4596,6 +5284,89 @@ def profile_suspicious_file(path, max_preview_lines=40, max_strings=80):
 
 
 @mcp.tool()
+def scan_yara(remote_path, rules_path='', max_bytes=100 * 1024 * 1024):
+    """
+    下载单个远程文件并使用本地 YARA 规则扫描。
+    调用：需要对可疑样本做特征匹配、确认家族或补充静态检测时使用。
+    输出：返回 YARA 命中规则、匹配字符串片段和样本哈希；本地 yara 或规则缺失时明确标注。
+    """
+    if not check_session():
+        return SESSION_ERROR
+    if not isinstance(remote_path, str) or not remote_path.strip():
+        return 'remote_path 不能为空'
+    try:
+        max_bytes = max(1024, min(int(max_bytes), 500 * 1024 * 1024))
+    except (TypeError, ValueError):
+        max_bytes = 100 * 1024 * 1024
+
+    yara_binary = shutil.which('yara') or shutil.which('yara64')
+    if not yara_binary:
+        return '[NOT_FOUND] 本地未安装 yara，无法执行 YARA 扫描'
+
+    rules = Path(rules_path).expanduser() if rules_path else Path(base_dir) / 'extensions' / 'yara' / 'index.yar'
+    if not rules.is_absolute():
+        rules = Path(base_dir) / rules
+    if not rules.is_file():
+        return f'[NOT_FOUND] YARA 规则文件不存在: {rules}'
+
+    remote_path = remote_path.strip()
+    quoted_remote = quote_remote_path(remote_path)
+    stat_result = exec_command(
+        ssh_session.client,
+        f"stat -c '%F\\t%s' {quoted_remote} 2>&1",
+        timeout=10,
+        max_bytes=4000,
+    )
+    if not stat_result.get('status'):
+        issue = remote_result_issue(stat_result, remote_path, '读取', include_missing=True)
+        return issue or command_failure(stat_result, '远程文件元数据读取失败')
+    fields = (stat_result.get('result') or '').strip().split('\t')
+    if len(fields) < 2:
+        return f'[FAILED] 远程文件元数据解析失败: {(stat_result.get("result") or "")[:200]}'
+    if 'directory' in fields[0].lower():
+        return '[FAILED] remote_path 必须指向文件而不是目录'
+    try:
+        remote_size = int(fields[1])
+    except ValueError:
+        return f'[FAILED] 远程文件大小解析失败: {fields[1][:100]}'
+    if remote_size > max_bytes:
+        return f'[FAILED] 远程文件大小 {remote_size} 超过上限 {max_bytes}'
+
+    work_dir = safe_local_subdir(f'downloads/yara/{get_run_id()}')
+    local_file = work_dir / 'sample.bin'
+    try:
+        download = sftp_download(
+            ssh_session.client, remote_path, str(local_file),
+            timeout=180, max_bytes=max_bytes,
+        )
+        if not download.get('status'):
+            return f'[FAILED] 样本下载失败: {download.get("error") or "未知错误"}'
+        try:
+            completed = subprocess.run(
+                [yara_binary, '-s', '-w', str(rules), str(local_file)],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            return f'[FAILED] YARA 扫描超时（180 秒）: {remote_path}'
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or '').strip().splitlines()
+            return f'[FAILED] YARA 扫描失败: {detail[0][:300] if detail else completed.returncode}'
+
+        stdout = (completed.stdout or '').strip()
+        if not stdout:
+            return f'[i] YARA 未命中: {remote_path}（规则: {rules.name}，样本大小: {remote_size} bytes）'
+        preview, truncated = truncate_text(stdout, 8000)
+        header = f'[!] YARA 命中: {remote_path}\n[i] 规则文件: {rules}'
+        return header + '\n' + preview + ('\n[TRUNCATED] YARA 输出已截断' if truncated else '')
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@mcp.tool()
 def download_file(remote_path, local_dir='downloads/evidence', max_bytes=100 * 1024 * 1024):
     """
     下载目标主机文件到本地取证目录。
@@ -4733,6 +5504,322 @@ def collect_evidence_bundle(include_logs=True, include_files=False):
         path.write_text(header + body, encoding='utf-8', errors='ignore')
         written.append(str(path))
     return {"status": True, "bundle_dir": str(bundle_dir), "files": written}
+
+
+BASELINE_SECTION_NAMES = (
+    'files', 'users', 'empty_passwords', 'suid', 'packages',
+    'services', 'ports', 'modules', 'kernel',
+)
+
+
+def baseline_storage_path(name='default'):
+    safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name or 'default')).strip('._') or 'default'
+    with session_lock:
+        host = (ssh_session.target_ip if ssh_session else '') or 'unknown'
+    safe_host = re.sub(r'[^A-Za-z0-9_.:-]+', '_', host) or 'unknown'
+    directory = Path(base_dir) / 'downloads' / 'baselines' / safe_host
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f'{safe_name}.json'
+
+
+def parse_baseline_section(section, text):
+    """Parse one baseline section into a hash map or a sorted line list."""
+    if section == 'files':
+        mapping = {}
+        for line in (text or '').splitlines():
+            line = line.strip()
+            if not line or line.startswith('READFAIL'):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2 and re.fullmatch(r'[0-9a-fA-F]{32,128}', parts[0]):
+                mapping[parts[1].strip()] = parts[0].lower()
+        return mapping
+    return sorted({
+        line.strip() for line in (text or '').splitlines()
+        if line.strip() and not line.startswith('READFAIL')
+    })
+
+
+def parse_baseline_output(text, nonce):
+    """Split baseline command output by nonce-scoped markers."""
+    error_mark = f'@@AUTOIR_BASE:{nonce}:ERR@@'
+    body, _, error_text = (text or '').partition(error_mark)
+    found = []
+    for section in BASELINE_SECTION_NAMES:
+        mark = f'@@AUTOIR_BASE:{nonce}:{section.upper()}@@'
+        position = body.find(mark)
+        if position >= 0:
+            found.append((position, section, mark))
+    found.sort()
+    sections = {}
+    for index, (position, section, mark) in enumerate(found):
+        start = position + len(mark)
+        end = found[index + 1][0] if index + 1 < len(found) else len(body)
+        sections[section] = body[start:end].strip('\n')
+    return sections, error_text.strip()
+
+
+def baseline_command(nonce):
+    marks = {
+        section: f'@@AUTOIR_BASE:{nonce}:{section.upper()}@@'
+        for section in BASELINE_SECTION_NAMES
+    }
+    err_mark = f'@@AUTOIR_BASE:{nonce}:ERR@@'
+    parts = [
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_base_$$.err); '
+        "if command -v sha256sum >/dev/null 2>&1; then hs=sha256sum; else hs=md5sum; fi",
+        f"printf '{marks['files']}\\n'",
+        'for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers '
+        '/etc/ssh/sshd_config /etc/ld.so.preload /etc/crontab /etc/rc.local /etc/hosts '
+        '/etc/resolv.conf /etc/fstab /etc/environment /etc/profile /etc/bash.bashrc '
+        '/etc/audit/audit.rules /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys '
+        '/home/*/.ssh/authorized_keys2 /etc/ssh/sshd_config.d/* /etc/pam.d/* '
+        '/etc/ld.so.conf /etc/ld.so.conf.d/* /etc/cron.d/* /etc/cron.daily/* '
+        '/etc/cron.hourly/* /etc/cron.weekly/* /etc/cron.monthly/* /var/spool/cron/* '
+        '/var/spool/cron/crontabs/* /etc/audit/rules.d/* /etc/init.d/* /etc/profile.d/*.sh '
+        '/etc/sysctl.conf /etc/sysctl.d/*; do '
+        '[ -f "$f" ] || continue; '
+        '$hs "$f" 2>>"$err" || echo "READFAIL  $f"; done | sort -u | head -n 1200',
+        f"printf '\\n{marks['users']}\\n'",
+        "awk -F: '$3==0 || ($3>=1000 && $3<65534) {print $1\"|\"$3\"|\"$6\"|\"$7}' "
+        '/etc/passwd 2>>"$err" | sort',
+        f"printf '\\n{marks['empty_passwords']}\\n'",
+        "awk -F: '$2==\"\" {print $1}' /etc/shadow 2>>\"$err\" | sort",
+        f"printf '\\n{marks['suid']}\\n'",
+        'for d in /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin '
+        '/tmp /var/tmp /dev/shm /run/shm; do '
+        '[ -d "$d" ] && find "$d" -xdev -type f \\( -perm -4000 -o -perm -2000 \\) '
+        '2>>"$err"; done | sort -u | head -n 3000',
+        f"printf '\\n{marks['packages']}\\n'",
+        'if command -v rpm >/dev/null 2>&1; then rpm -qa 2>/dev/null | sort; '
+        'elif command -v dpkg-query >/dev/null 2>&1; then '
+        "dpkg-query -W -f='${Package} ${Version}\\n' 2>/dev/null | sort; "
+        'elif command -v apk >/dev/null 2>&1; then apk info -v 2>/dev/null | sort; fi '
+        '| head -n 5000',
+        f"printf '\\n{marks['services']}\\n'",
+        'if command -v systemctl >/dev/null 2>&1; then '
+        'systemctl list-unit-files --type=service --state=enabled --no-pager 2>/dev/null '
+        "| awk 'NR>1 {print $1}'; "
+        'elif command -v rc-update >/dev/null 2>&1; then rc-update show 2>/dev/null; '
+        'elif command -v chkconfig >/dev/null 2>&1; then '
+        "chkconfig --list 2>/dev/null | awk '$3==\"3:on\" {print $1}'; fi "
+        '| sort -u | head -n 1000',
+        f"printf '\\n{marks['ports']}\\n'",
+        'if command -v ss >/dev/null 2>&1; then '
+        "ss -lntu 2>/dev/null | awk 'NR>1 {print $1\" \"$5}'; "
+        'elif command -v netstat >/dev/null 2>&1; then '
+        "netstat -lntu 2>/dev/null | awk 'NR>1 {print $1\" \"$4}'; fi "
+        '| sort -u | head -n 500',
+        f"printf '\\n{marks['modules']}\\n'",
+        "lsmod 2>/dev/null | awk 'NR>1 {print $1}' | sort",
+        f"printf '\\n{marks['kernel']}\\n'",
+        'uname -r 2>/dev/null; cat /proc/sys/kernel/tainted 2>/dev/null; hostname 2>/dev/null',
+        f"printf '\\n{err_mark}\\n'",
+        'grep -v "No such file or directory" "$err" 2>/dev/null | head -n 20; '
+        'rm -f "$err"',
+    ]
+    return '; '.join(parts)
+
+
+def baseline_collect():
+    """Collect and parse baseline sections. Returns (sections, issue, warnings)."""
+    nonce = get_run_id()
+    result = exec_command(
+        ssh_session.client,
+        baseline_command(nonce),
+        timeout=120,
+        max_bytes=3000000,
+    )
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 基线采集输出超过上限，结果可能不完整')
+    text = result.get('result') or ''
+    if not text:
+        return None, command_failure(result, '基线采集失败'), warnings
+    raw_sections, error_text = parse_baseline_output(text, nonce)
+    sections = {
+        name: parse_baseline_section(name, content)
+        for name, content in raw_sections.items()
+    }
+    if not sections:
+        return None, '[FAILED] 基线采集未返回可解析数据，可能命令不兼容或权限不足', warnings
+    if error_text:
+        if 'permission denied' in error_text.lower():
+            warnings.append(f'[PERMISSION] 基线采集部分文件不可读: {error_text.splitlines()[0][:200]}')
+        else:
+            warnings.append(f'[WARN] 基线采集告警: {error_text.splitlines()[0][:200]}')
+    return sections, '', warnings
+
+
+def compare_baseline_sections(old_sections, new_sections, limit=5000):
+    """Return added/removed/changed items between two baseline section maps."""
+    changes = []
+    for section in BASELINE_SECTION_NAMES:
+        old_value = (old_sections or {}).get(section)
+        new_value = (new_sections or {}).get(section)
+        if isinstance(old_value, dict) or isinstance(new_value, dict):
+            old_map = old_value if isinstance(old_value, dict) else {}
+            new_map = new_value if isinstance(new_value, dict) else {}
+            for item in sorted(set(old_map) | set(new_map)):
+                if item not in old_map:
+                    changes.append({'section': section, 'change': 'added', 'item': item, 'detail': ''})
+                elif item not in new_map:
+                    changes.append({'section': section, 'change': 'removed', 'item': item, 'detail': ''})
+                elif old_map[item] != new_map[item]:
+                    changes.append({
+                        'section': section,
+                        'change': 'changed',
+                        'item': item,
+                        'detail': f'{str(old_map[item])[:12]} -> {str(new_map[item])[:12]}',
+                    })
+                if len(changes) >= limit:
+                    return changes
+        else:
+            old_set = set(old_value or [])
+            new_set = set(new_value or [])
+            for item in sorted(new_set - old_set):
+                changes.append({'section': section, 'change': 'added', 'item': item, 'detail': ''})
+                if len(changes) >= limit:
+                    return changes
+            for item in sorted(old_set - new_set):
+                changes.append({'section': section, 'change': 'removed', 'item': item, 'detail': ''})
+                if len(changes) >= limit:
+                    return changes
+    return changes
+
+
+@mcp.tool()
+def baseline_capture(name='default'):
+    """
+    采集并保存主机检测基线到本地。
+    调用：应急处置前建立可信快照，或需要后续对比文件、账户、SUID、服务、端口和模块变化时使用。
+    输出：返回基线文件路径、目标信息和各分项数量；采集失败或权限不足会明确标注。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    path = baseline_storage_path(name)
+    sections, issue, warnings = baseline_collect()
+    if sections is None:
+        return append_warnings(issue or '[FAILED] 基线采集失败', warnings)
+
+    with session_lock:
+        target = {
+            'ip': ssh_session.target_ip,
+            'port': ssh_session.target_port,
+            'username': ssh_session.target_username,
+        }
+    payload = {
+        'version': 1,
+        'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'target': target,
+        'sections': sections,
+    }
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    except OSError as exc:
+        return f'[FAILED] 基线写入失败: {exc}'
+
+    counts = [
+        f'files: {len(sections.get("files", {}))}',
+        f'users: {len(sections.get("users", []))}',
+        f'empty_passwords: {len(sections.get("empty_passwords", []))}',
+        f'suid: {len(sections.get("suid", []))}',
+        f'packages: {len(sections.get("packages", []))}',
+        f'services: {len(sections.get("services", []))}',
+        f'ports: {len(sections.get("ports", []))}',
+        f'modules: {len(sections.get("modules", []))}',
+    ]
+    output = [
+        f'[i] 基线已保存: {path}',
+        f'[i] 目标: {target["username"] or "-"}@{target["ip"] or "-"}:{target["port"]}',
+        f'[i] 采集时间: {payload["created_at"]}',
+        f'[i] 分项数量: {", ".join(counts)}',
+    ]
+    return append_warnings('\n'.join(output), warnings)
+
+
+@mcp.tool()
+def baseline_diff(name='default', update=False):
+    """
+    对比当前主机与本地基线，输出新增、消失和内容变化项。
+    调用：需要发现账户、SSH 配置、PAM、计划任务、SUID、服务、端口和模块变化时使用。
+    输出：返回分项差异列表；基线不存在、目标不一致或采集失败会明确标注。update=True 时在对比后更新基线。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    path = baseline_storage_path(name)
+    if not path.is_file():
+        return f'[NOT_FOUND] 基线不存在: {path}；请先调用 baseline_capture(name="{name}")'
+
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f'[FAILED] 基线读取失败: {exc}'
+    old_sections = payload.get('sections') or {}
+    saved_target = payload.get('target') or {}
+    with session_lock:
+        current_ip = ssh_session.target_ip
+    saved_ip = str(saved_target.get('ip') or '')
+    if saved_ip and current_ip and saved_ip != current_ip:
+        return (
+            f'[FAILED] 基线目标为 {saved_ip}，当前连接为 {current_ip}，'
+            f'请使用不同 name 重新采集基线'
+        )
+
+    sections, issue, warnings = baseline_collect()
+    if sections is None:
+        return append_warnings(issue or '[FAILED] 当前状态采集失败', warnings)
+
+    changes = compare_baseline_sections(old_sections, sections)
+    output = [
+        f'[i] 基线文件: {path}',
+        f'[i] 基线时间: {payload.get("created_at") or "-"}',
+    ]
+    if not changes:
+        output.append('[i] 与基线一致，未发现文件、账户、SUID、服务、端口或模块变化')
+    else:
+        grouped = collections.OrderedDict()
+        for change in changes:
+            grouped.setdefault(change['section'], []).append(change)
+        labels = {'added': '新增', 'removed': '消失', 'changed': '变化'}
+        total = 0
+        for section, items in grouped.items():
+            total += len(items)
+            tag = '[i]' if section in ('packages', 'kernel') else '[!]'
+            output.append(f'\n{section} 差异 {len(items)} 项')
+            for change in items[:40]:
+                detail = f'\t{change["detail"]}' if change['detail'] else ''
+                output.append(
+                    f'{tag} {labels[change["change"]]}: {change["item"]}{detail}'
+                )
+            if len(items) > 40:
+                output.append(f'[TRUNCATED] {section} 另有 {len(items) - 40} 项差异未展示')
+        output.insert(2, f'[i] 共发现 {total} 项差异')
+
+    if update:
+        with session_lock:
+            target = {
+                'ip': ssh_session.target_ip,
+                'port': ssh_session.target_port,
+                'username': ssh_session.target_username,
+            }
+        payload = {
+            'version': 1,
+            'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'target': target,
+            'sections': sections,
+        }
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            output.append(f'[i] 基线已更新: {path}')
+        except OSError as exc:
+            warnings.append(f'[FAILED] 基线更新失败: {exc}')
+
+    return append_warnings('\n'.join(output), warnings)
 
 
 @mcp.tool()
@@ -4906,6 +5993,287 @@ def check_container_processes():
     if result['status'] and result['result']:
         return result['result']
     return command_failure(result, '容器进程信息获取失败')
+
+
+SENSITIVE_CONTAINER_MOUNTS = {
+    '/', '/etc', '/root', '/home', '/proc', '/sys', '/dev',
+    '/var/run/docker.sock', '/run/docker.sock',
+    '/run/containerd/containerd.sock', '/var/run/containerd/containerd.sock',
+    '/var/lib/docker', '/var/lib/containerd', '/var/lib/kubelet',
+}
+DANGEROUS_CAPABILITIES = {
+    'SYS_ADMIN', 'SYS_PTRACE', 'SYS_MODULE', 'SYS_RAWIO', 'SYS_BOOT',
+    'DAC_READ_SEARCH', 'BPF', 'PERFMON',
+}
+
+
+def _sensitive_mount(source):
+    source = str(source or '').strip()
+    if not source:
+        return False
+    normalized = source.rstrip('/') or '/'
+    if normalized in SENSITIVE_CONTAINER_MOUNTS:
+        return True
+    if normalized.endswith(('docker.sock', 'containerd.sock', 'crio.sock')):
+        return True
+    return normalized.startswith(('/proc/', '/sys/', '/dev/'))
+
+
+def container_escape_findings(config):
+    """Return escape-risk findings for one docker/podman inspect object."""
+    host = config.get('HostConfig') or {}
+    findings = []
+    if host.get('Privileged'):
+        findings.append('[!] 容器以 privileged 模式运行')
+    namespace_labels = (
+        ('PidMode', 'host PID 命名空间'),
+        ('IpcMode', 'host IPC 命名空间'),
+        ('NetworkMode', 'host 网络命名空间'),
+        ('UsernsMode', 'host user 命名空间'),
+    )
+    for key, label in namespace_labels:
+        if str(host.get(key) or '').strip().lower() == 'host':
+            findings.append(f'[!] 使用 {label}')
+    capabilities = [
+        str(cap).upper() for cap in (host.get('CapAdd') or []) if str(cap).strip()
+    ]
+    dangerous = sorted(set(capabilities) & DANGEROUS_CAPABILITIES)
+    if dangerous:
+        findings.append(f'[!] 添加危险 capability: {", ".join(dangerous)}')
+    for option in host.get('SecurityOpt') or []:
+        text = str(option).lower()
+        if 'unconfined' in text or 'label=disable' in text:
+            findings.append(f'[!] 安全配置被禁用: {option}')
+    if host.get('Devices'):
+        findings.append('[i] 容器直通主机设备，需核对设备类型')
+    for mount in config.get('Mounts') or []:
+        source = str(mount.get('Source') or mount.get('source') or '').strip()
+        destination = str(mount.get('Destination') or mount.get('destination') or '').strip()
+        if not _sensitive_mount(source):
+            continue
+        writable = mount.get('RW', mount.get('rw', True))
+        tag = '[!]' if writable else '[i]'
+        findings.append(
+            f'{tag} 敏感路径挂载: {source} -> {destination or "-"}'
+            f'（{"读写" if writable else "只读"}）'
+        )
+    return list(dict.fromkeys(findings))
+
+
+@mcp.tool()
+def check_container_escape():
+    """
+    检查容器特权配置、命名空间共享、危险 capability 和敏感路径挂载。
+    调用：排查容器逃逸风险、Docker Socket 暴露、宿主机目录挂载或提权配置时使用。
+    输出：返回每个容器的特权/命名空间/capability/挂载风险和容器运行时 socket 权限；需 docker/podman 可访问。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    runtime = container_runtime()
+    if not runtime:
+        return empty_result('未发现 docker/podman 命令')
+
+    ids, error = container_ids(runtime)
+    if error:
+        return f'[FAILED] {runtime} 容器枚举失败: {error[:300]}'
+    if not ids:
+        return empty_result('未发现容器')
+
+    quoted_ids = ' '.join(shlex.quote(cid) for cid in ids[:100])
+    result = exec_command(
+        ssh_session.client,
+        f"{runtime} inspect --format '{{{{json .}}}}' {quoted_ids} 2>&1",
+        timeout=45,
+        max_bytes=1000000,
+    )
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, '容器 inspect 信息获取失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 容器 inspect 输出超过采集上限，结果可能不完整')
+    if not result.get('status') and not result.get('result'):
+        return command_failure(result, '容器 inspect 信息获取失败')
+
+    output = []
+    checked = 0
+    parse_failures = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            config = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            parse_failures += 1
+            continue
+        if not isinstance(config, dict):
+            parse_failures += 1
+            continue
+        checked += 1
+        name = str(config.get('Name') or '').lstrip('/') or str(config.get('Id') or '')[:12]
+        image = str(config.get('Config', {}).get('Image') or '-')
+        findings = container_escape_findings(config)
+        if findings:
+            output.append(f'容器: {name}\timage: {image}')
+            output.extend(f'\t{finding}' for finding in findings)
+
+    if checked == 0 and parse_failures:
+        detail = text.splitlines()[0][:300]
+        if 'permission denied' in text.lower() or 'access denied' in text.lower():
+            return f'[PERMISSION] 容器 inspect 权限不足: {detail}'
+        return f'[FAILED] 容器 inspect 输出无法解析: {detail}'
+    if parse_failures:
+        warnings.append(f'[WARN] {parse_failures} 行 inspect 输出无法解析，可能包含错误信息')
+    socket_result = exec_command(
+        ssh_session.client,
+        "stat -c '%a %U:%G %n' /var/run/docker.sock /run/docker.sock "
+        '/run/containerd/containerd.sock /var/run/containerd/containerd.sock 2>/dev/null',
+        timeout=15,
+    )
+    socket_lines = [line.strip() for line in (socket_result.get('result') or '').splitlines() if line.strip()]
+    for line in socket_lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mode, owner, path = parts[0], parts[1], ' '.join(parts[2:])
+        finding = ''
+        try:
+            if int(mode, 8) & 0o002:
+                finding = '[!] 运行时 socket 全局可写，存在容器逃逸/未授权控制风险'
+        except ValueError:
+            pass
+        output.append(f'[i] 运行时 socket: {path}\tmode: {mode}\towner: {owner}' + (f'\t{finding}' if finding else ''))
+
+    if not output:
+        return append_warnings(
+            f'[i] 已检查 {checked} 个容器，未发现明显逃逸配置'
+            + (f'（{parse_failures} 行输出无法解析）' if parse_failures else ''),
+            warnings,
+        )
+    if checked:
+        output.insert(0, f'[i] 已检查 {checked} 个容器')
+    return append_warnings('\n'.join(output), warnings)
+
+
+def kubernetes_pod_findings(pod):
+    """Return security findings for one Kubernetes Pod object."""
+    spec = pod.get('spec') or {}
+    findings = []
+    host_fields = (
+        ('hostNetwork', '使用 hostNetwork'),
+        ('hostPID', '使用 hostPID'),
+        ('hostIPC', '使用 hostIPC'),
+    )
+    for field, label in host_fields:
+        if spec.get(field) is True:
+            findings.append(f'[!] {label}')
+    for volume in spec.get('volumes') or []:
+        host_path = volume.get('hostPath') or {}
+        path = str(host_path.get('path') or '').strip()
+        if not path:
+            continue
+        normalized = path.rstrip('/') or '/'
+        sensitive = (
+            normalized in ('/', '/etc', '/root', '/var/lib/kubelet',
+                           '/var/run/docker.sock', '/run/containerd/containerd.sock')
+            or normalized.startswith(('/etc/', '/proc/', '/sys/', '/var/lib/kubelet/'))
+        )
+        tag = '[!]' if sensitive else '[i]'
+        findings.append(f'{tag} hostPath 挂载: {path}')
+    for section in ('initContainers', 'containers', 'ephemeralContainers'):
+        for container in spec.get(section) or []:
+            name = str(container.get('name') or '-')
+            security = container.get('securityContext') or {}
+            if security.get('privileged') is True:
+                findings.append(f'[!] 容器 {name} 以 privileged 模式运行')
+            capabilities = (
+                security.get('capabilities', {}).get('add') or []
+                if isinstance(security.get('capabilities'), dict) else []
+            )
+            dangerous = sorted(
+                {str(cap).upper() for cap in capabilities} & DANGEROUS_CAPABILITIES
+            )
+            if dangerous:
+                findings.append(f'[!] 容器 {name} 添加危险 capability: {", ".join(dangerous)}')
+            if str(security.get('procMount') or '').lower() == 'unmasked':
+                findings.append(f'[!] 容器 {name} 使用 Unmasked /proc')
+            for port in container.get('ports') or []:
+                host_port = port.get('hostPort')
+                if host_port:
+                    findings.append(f'[i] 容器 {name} 使用 hostPort {host_port}')
+    return list(dict.fromkeys(findings))
+
+
+@mcp.tool()
+def check_kubernetes():
+    """
+    检查 Kubernetes Pod 安全配置。
+    调用：节点运行 Kubernetes 时，排查 hostPath、hostNetwork、特权容器和危险 capability。
+    输出：返回 Pod 的 hostPath/host 命名空间/特权/capability 风险；未配置 kubectl 或无权限时明确标注。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    probe = exec_command(ssh_session.client, 'command -v kubectl 2>/dev/null', timeout=10)
+    if not (probe.get('result') or '').strip():
+        return '[NOT_FOUND] 未发现 kubectl，目标可能不是 Kubernetes 节点或未配置管理工具'
+
+    result = exec_command(
+        ssh_session.client,
+        'kubectl get pods --all-namespaces -o json --request-timeout=20s 2>&1',
+        timeout=60,
+        max_bytes=3000000,
+    )
+    text = (result.get('result') or '').strip()
+    if not text:
+        return command_failure(result, 'Kubernetes Pod 列表获取失败')
+    if not result.get('status'):
+        kind = classify_remote_result(result)
+        if kind == 'permission_denied' or re.search(
+            r'unauthorized|forbidden|must be logged in|permission denied', text, re.I
+        ):
+            return f'[PERMISSION] kubectl 无权限读取 Pod: {text.splitlines()[0][:300]}'
+        return f'[FAILED] kubectl 读取 Pod 失败: {text.splitlines()[0][:300]}'
+
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return f'[FAILED] kubectl 输出无法解析为 JSON: {text.splitlines()[0][:300]}'
+    pods = payload.get('items') if isinstance(payload, dict) else None
+    if not isinstance(pods, list):
+        return '[FAILED] kubectl 输出缺少 items 字段，无法解析 Pod 列表'
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] Kubernetes Pod 输出超过采集上限，结果可能不完整')
+
+    output = []
+    suspicious = 0
+    for pod in pods:
+        metadata = pod.get('metadata') or {}
+        namespace = metadata.get('namespace') or 'default'
+        name = metadata.get('name') or '?'
+        findings = kubernetes_pod_findings(pod)
+        if not findings:
+            continue
+        suspicious += 1
+        output.append(f'Pod: {namespace}/{name}')
+        output.extend(f'\t{finding}' for finding in findings)
+        if len(output) >= 300:
+            output.append('[TRUNCATED] Pod 风险输出达到上限，后续未展示')
+            break
+
+    if not output:
+        return append_warnings(
+            f'[i] 已检查 {len(pods)} 个 Pod，未发现明显安全风险配置', warnings
+        )
+    output.insert(0, f'[i] 已检查 {len(pods)} 个 Pod，存在风险配置的 Pod {suspicious} 个')
+    return append_warnings('\n'.join(output), warnings)
 
 
 @mcp.tool()

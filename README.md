@@ -16,7 +16,7 @@ AutoIR_MCP/
 │   ├── functions.py           # SSH 命令、SFTP、SafeLine、本地规则、IOC/格式化 helper
 │   └── session.py             # SSH session 状态模型
 ├── config.json                # SafeLine 检测接口配置
-├── extensions/                # HeMa、rkhunter 等本地资产
+├── extensions/                # HeMa、rkhunter、YARA 规则等本地资产
 ├── tests/                     # 标准库 unittest 回归测试
 ├── requirements.txt           # Python 依赖
 └── README.md
@@ -60,6 +60,7 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `download_file`：下载远程文件到本地取证目录。
 - `upload_file`：上传本地 `extensions/` 或 `downloads/` 内文件到目标主机。
 - `collect_evidence_bundle`：采集系统、用户、进程、网络、服务、计划任务和日志摘要。
+- `scan_yara`：将单个远程文件下载到独立临时目录，调用本地 `yara -s -w` 扫描；默认规则为 `extensions/yara/index.yar`，支持自定义规则路径和下载大小上限，扫描结束删除样本。
 - `check_bin`：检查 `/usr/bin` 近期修改、权限和属主异常。
 - `check_tmp`：扫描 `/tmp`、`/var/tmp`、`/dev/shm`、`/run/shm` 中的文件，并标注可执行文件和隐藏文件。
 - `check_recent_files`：检查指定目录近期变更文件。
@@ -87,6 +88,7 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `check_exe`
 - `check_mount`
 - `check_deleted_exe`
+- `check_memory_maps`：扫描 `/proc/<pid>/maps` 中的可写可执行映射、临时目录映射、`(deleted)` 映射、`memfd:` 映射和匿名可执行映射，并关联进程命令行。
 
 ### 网络
 
@@ -132,8 +134,18 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `check_login_success`
 - `check_login_fail`
 - `check_login_sessions`
+- `check_container_escape`：解析 `docker/podman inspect`，检查 privileged、host PID/IPC/网络/User 命名空间、危险 capability、`seccomp/apparmor=unconfined`、敏感路径挂载、Docker/containerd socket 及其权限。
+- `check_kubernetes`：通过 `kubectl get pods -A -o json` 检查 hostNetwork/hostPID/hostIPC、hostPath、特权容器、危险 capability 和 hostPort；未安装 kubectl 或无权限时明确标注。
+- `check_auditd`：读取 `auditctl -l`、auditd 状态和 `/var/log/audit/audit.log`，回退 `ausearch`/`journalctl`；解析 EXECVE/PROCTITLE 十六进制命令、临时目录执行、AVC denied、审计规则变更和守护进程异常结束。
+- `check_log_integrity`：检查 wtmp/btmp/lastlog/auth.log/secure/audit.log 等文件的大小、权限、属主和时间，执行 `journalctl --verify`、boot 列表和认证日志断层检测，并扫描 logrotate 配置中的可疑命令。
 - `check_kernel_modules`
+- `check_ebpf`：枚举 `bpftool prog/map/net/cgroup`、`/sys/fs/bpf` pinned 对象和 `unprivileged_bpf_disabled`，并过滤内核日志中的 BPF、Oops、模块校验和 taint 线索。
 - `RootkitUpload`（旧名 `RookitUpload` 仍保留为兼容别名）
+
+### 基线与对比
+
+- `baseline_capture`：采集文件哈希（账户、SSH、PAM、sudoers、计划任务、profile、审计规则等）、UID 0/普通用户、空口令账户、SUID/SGID、软件包、服务、监听端口、内核模块和内核版本，保存到本地 `downloads/baselines/<目标IP>/<name>.json`。
+- `baseline_diff`：与本地基线对比，输出新增、消失和哈希变化项；支持 `update=True` 在对比后更新基线，并拒绝跨目标主机误对比。
 
 ## SafeLine 配置
 
@@ -159,6 +171,11 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - SSH 排查同时覆盖 `authorized_keys`、`authorized_keys2`、`sshrc`、`~/.ssh/rc` 和 `~/.ssh/config` 中的命令触发配置；`check_pam` 和 `check_sshd_config` 进一步覆盖 PAM 外部命令模块、`nullok`、非标准 include、`AuthorizedKeysCommand`、`ForceCommand` 和异常 HostKey/SFTP 路径。
 - `check_auth_log` 会把同一 IP 的大量失败与成功登录关联，标记“疑似暴力破解后成功登录”，并汇总无效用户名；`check_login_sessions` 关联 `who`、`last`、sshd 进程父子关系和已建立 SSH 连接，`notty` 与父进程为 1 的 sshd 会话会被标注复核。
 - `check_kernel_modules` 解析内核 taint 位（强制加载/卸载、oops、树外、未签名模块），并核对 `lsmod` 模块文件是否位于标准模块目录；已知 rootkit 模块名会重点标注。
+- `check_auditd` 优先读取 audit.log，回退 `ausearch` 和 `journalctl`；PROCTITLE/EXECVE 十六进制参数会还原为可读命令，审计未启用、规则为空或日志不可读会明确标注。
+- `check_ebpf` 在 `bpftool` 缺失时仍检查 pinned 对象、非特权 BPF 配置和内核日志；`check_memory_maps` 依赖 `/proc` 可读性，非 root 会提示结果不完整。
+- `check_log_integrity` 区分“文件为空可能被清空”“全局可写”“登录审计文件缺失”，并检测认证日志超过 24 小时的时间断层；journal 校验失败和 logrotate 可疑命令会重点标注。
+- 基线只保存在本地 `downloads/baselines/`，不会上传目标主机；`baseline_diff` 会拒绝与不同目标 IP 的基线对比。
+- `scan_yara` 仅下载单个文件，默认 100 MB 上限，样本保存在独立临时目录并在扫描结束删除；本地缺少 yara 或规则文件时明确标注，不会假装未命中。
 - `check_log` 会聚合路径穿越、SQL 注入、命令注入、PHP 伪协议、WebShell/上传脚本访问和扫描器 User-Agent，按来源 IP 与特征统计成功请求数，避免逐行刷屏。
 - SUID/SGID 检查覆盖 `df` 列出的所有本地挂载点（包括 `/dev/shm`、`/run/shm` 等 tmpfs），同时检查 SUID 与 SGID；常见系统程序标记为“需校验包完整性”，非典型路径和属主非 root 标记为“需人工复核”，避免把 `passwd`、`sudo` 等全部误报为后门。
 - 服务枚举在 systemd 之外回退到 OpenRC `rc-status`/`rc-update`、`chkconfig` 和 `service --status-all`；网络连接缺少进程信息时会明确提示非 root 或 hidepid 限制。

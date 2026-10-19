@@ -5,7 +5,8 @@ TOOL_CATEGORIES = {
         "extract_iocs", "generate_timeline", "analyze_attack_chain", "generate_report",
     ],
     "取证文件": [
-        "stat_file", "hash_file", "profile_suspicious_file", "download_file", "upload_file", "collect_evidence_bundle",
+        "stat_file", "hash_file", "profile_suspicious_file", "download_file", "upload_file",
+        "collect_evidence_bundle", "scan_yara",
     ],
     "用户/权限": [
         "check_home", "check_passwd", "check_shadow", "check_sudoers", "check_ssh_keys",
@@ -13,7 +14,7 @@ TOOL_CATEGORIES = {
     ],
     "进程": [
         "get_ps", "check_mine", "check_exec", "check_pid", "check_exe", "check_mount",
-        "check_deleted_exe",
+        "check_deleted_exe", "check_memory_maps",
     ],
     "网络": [
         "get_localhost", "check_network", "check_listening_ports", "extract_iocs", "check_eth", "check_hosts",
@@ -33,12 +34,14 @@ TOOL_CATEGORIES = {
     "服务/容器": [
         "list_services", "check_enabled_services", "check_recent_systemd_changes",
         "check_docker_containers", "check_container_mounts", "check_container_processes",
+        "check_container_escape", "check_kubernetes",
     ],
     "日志": [
         "check_log", "check_web_logs_auto", "check_login_success", "check_login_fail",
-        "check_login_sessions",
+        "check_login_sessions", "check_auditd", "check_log_integrity",
     ],
-    "Rootkit": ["RootkitUpload", "check_kernel_modules"],
+    "Rootkit": ["RootkitUpload", "check_kernel_modules", "check_ebpf"],
+    "基线/对比": ["baseline_capture", "baseline_diff"],
 }
 
 

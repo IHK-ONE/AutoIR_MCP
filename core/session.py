@@ -1,6 +1,9 @@
 class SSHSession:
     def __init__(self, client=None):
         self.client = client
+        self.target_ip = ''
+        self.target_port = 22
+        self.target_username = ''
         self.safeline_available = False
         self.safeline_checked_at = 0.0
         self.safeline_error = ''
