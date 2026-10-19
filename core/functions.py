@@ -1,6 +1,8 @@
 import json
 import re
+import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -11,6 +13,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / 'config.json'
 _safeline_server = ''
 _safeline_config_mtime = None
+_safeline_session = requests.Session()
+_safeline_cache = {}
+_safeline_cache_lock = threading.Lock()
+_safeline_rate_lock = threading.Lock()
+_safeline_request_times = []
+SAFELINE_CACHE_TTL = 300
+SAFELINE_UNAVAILABLE_TTL = 30
+SAFELINE_CACHE_MAX = 512
+SAFELINE_MAX_QUERIES_PER_MINUTE = 120
+COMMAND_CONCURRENCY = 8
+_command_semaphore = threading.BoundedSemaphore(COMMAND_CONCURRENCY)
 
 
 def is_safe_path(base_dir, candidate):
@@ -22,11 +35,18 @@ def is_safe_path(base_dir, candidate):
 
 
 def is_safe_tar_member(destination, member, max_member_size=20 * 1024 * 1024):
-    if member.issym() or member.islnk() or member.isdev() or member.size > max_member_size:
+    if member.issym() or member.islnk() or member.isdev() or member.isfifo() or member.size > max_member_size:
         return False
-    if Path(member.name).is_absolute() or ".." in Path(member.name).parts:
+    # Normalize Windows separators so "..\\evil" cannot slip through Path.parts.
+    name = member.name.replace("\\", "/")
+    if not name or name.startswith("/") or ".." in Path(name).parts:
         return False
-    return is_safe_path(destination, Path(destination) / member.name)
+    return is_safe_path(destination, Path(destination) / name)
+
+
+def get_run_id():
+    """Return a collision-resistant identifier for one tool run."""
+    return datetime.now().strftime('%Y_%m_%d_%H_%M_%S_%f') + '_' + uuid.uuid4().hex[:8]
 
 
 def truncate_text(value, max_chars=4000):
@@ -36,7 +56,10 @@ def truncate_text(value, max_chars=4000):
     return value[:max_chars] + "\n[TRUNCATED] output exceeded limit", True
 
 
-FAILURE_KEYWORDS = ('错误', '失败', '[ERROR]', '命令超时', '权限不足', 'Traceback', 'exception')
+FAILURE_KEYWORDS = (
+    '错误', '失败', '[ERROR]', '[FAILED]', '[PERMISSION]', '[NOT_FOUND]',
+    '命令超时', '权限不足', 'Traceback', 'exception',
+)
 SUSPICIOUS_KEYWORDS = ('[!]', '可疑', '异常', '后门', 'webshell', 'WebShell', 'deleted exe', '反弹', '挖矿', 'SUID', 'authorized_keys')
 HIGH_RISK_KEYWORDS = ('root 标识用户', '空口令', 'ld.so.preload', 'SSH wrapper', '隐藏 PID')
 
@@ -72,13 +95,72 @@ def infer_risk_level(text):
     return '信息'
 
 
+def classify_remote_error_text(text):
+    """Classify a remote error message without guessing from empty output."""
+    text = (text or '').lower()
+    if 'command not found' in text:
+        return 'error'
+    permission_markers = (
+        'permission denied', 'operation not permitted', 'access denied',
+        '权限不足', '没有权限',
+    )
+    if any(marker in text for marker in permission_markers):
+        return 'permission_denied'
+    missing_markers = (
+        'no such file', 'not found', 'cannot stat', "can't open",
+        'does not exist', '找不到', '不存在',
+    )
+    if any(marker in text for marker in missing_markers):
+        return 'not_found'
+    return 'error'
+
+
+def classify_remote_result(result):
+    """Return ok / not_found / permission_denied / timeout / error."""
+    if not isinstance(result, dict):
+        return 'error'
+    if result.get('status'):
+        return 'ok'
+    if result.get('timeout'):
+        return 'timeout'
+    detail = ' '.join(str(result.get(key) or '') for key in ('stderr', 'result', 'error'))
+    return classify_remote_error_text(detail)
+
+
+def remote_result_issue(result, target, action='读取', include_missing=False):
+    """Build an explicit, non-empty issue for a failed remote read."""
+    kind = classify_remote_result(result)
+    if kind == 'not_found':
+        return f'[NOT_FOUND] {action} {target}: 文件或路径不存在' if include_missing else ''
+    if kind == 'permission_denied':
+        return f'[PERMISSION] {action} {target}: 权限不足'
+    if kind == 'timeout':
+        return f'[FAILED] {action} {target}: 命令超时'
+    detail = result.get('error') or result.get('stderr') or result.get('result') or '无错误详情'
+    detail = str(detail).strip().splitlines()[0][:300] if str(detail).strip() else '无错误详情'
+    return f'[FAILED] {action} {target}: {detail}'
+
+
+def remote_error_issue(kind, target, detail='', action='读取'):
+    if kind == 'not_found':
+        return ''
+    if kind == 'permission_denied':
+        return f'[PERMISSION] {action} {target}: 权限不足'
+    if kind == 'timeout':
+        return f'[FAILED] {action} {target}: 命令超时'
+    detail = (detail or '').strip().splitlines()[0][:300] if (detail or '').strip() else '无错误详情'
+    return f'[FAILED] {action} {target}: {detail}'
+
+
 def normalize_tool_result(tool, value, empty_message="未发现明显异常"):
     data = None
     error = ''
     kind = type(value).__name__ if value is not None else 'none'
+    explicit_status = None
 
     if isinstance(value, dict):
-        status = bool(value.get('status', True))
+        explicit_status = value.get('status')
+        status = bool(explicit_status) if explicit_status is not None else True
         result = value_to_text(value.get('result', ''))
         explicit_data = value.get('data') if 'data' in value else None
         data = explicit_data if explicit_data is not None else {key: item for key, item in value.items() if key not in {'status', 'result', 'error', 'meta', 'data'}} or None
@@ -99,10 +181,15 @@ def normalize_tool_result(tool, value, empty_message="未发现明显异常"):
     if not result:
         result = f'[EMPTY] {tool}: {empty_message}'
     risk = infer_risk_level(result)
-    if risk == '未发现明显异常':
-        status = True
-    elif is_failure_text(result):
-        status = False
+    if explicit_status is None:
+        if risk == '未发现明显异常':
+            status = True
+        elif is_failure_text(result):
+            status = False
+            error = error or result
+    elif not status:
+        # Never turn an explicitly reported failure into a success just because
+        # the failure result happened to be empty.
         error = error or result
 
     return {
@@ -155,7 +242,12 @@ USER_PATTERNS = (
     re.compile(r'(?i)\binvalid\s+user\s+([A-Za-z0-9_][\w.-]{0,63})\b'),
     re.compile(r'(?i)\b(?:Accepted|Failed)\s+password\s+for\s+(?:invalid\s+user\s+)?([A-Za-z0-9_][\w.-]{0,63})\b'),
 )
-NOISE_DOMAIN_SUFFIXES = {'php', 'jsp', 'jspx', 'asp', 'aspx', 'sh', 'py', 'pl', 'txt', 'log', 'conf', 'ini'}
+NOISE_DOMAIN_SUFFIXES = {
+    'php', 'jsp', 'jspx', 'asp', 'aspx', 'sh', 'py', 'pl', 'txt', 'log', 'conf', 'ini',
+    'gz', 'tgz', 'zip', 'tar', 'rar', '7z', 'bz2', 'xz', 'db', 'sql', 'json', 'xml',
+    'html', 'htm', 'css', 'js', 'map', 'md', 'csv', 'png', 'jpg', 'jpeg', 'gif',
+    'svg', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'so', 'dll', 'exe', 'bin',
+}
 
 
 def valid_port(value):
@@ -370,54 +462,72 @@ def exec_command(client, command, timeout=10, max_bytes=1_000_000):
     }
     started = time.monotonic()
     channel = None
-    try:
-        timeout = max(1, int(timeout))
-        max_bytes = max(1024, int(max_bytes))
-        channel = client.get_transport().open_session()
-        channel.settimeout(1)
-        channel.exec_command(command)
-        stdout_chunks = []
-        stderr_chunks = []
-        stdout_size = stderr_size = 0
-        stdout_truncated = stderr_truncated = False
-        while True:
-            if time.monotonic() - started > timeout:
-                raise TimeoutError(f'{timeout}s')
-            if channel.recv_ready():
-                stdout_size, truncated = append_limited(stdout_chunks, stdout_size, channel.recv(32768), max_bytes)
-                stdout_truncated = stdout_truncated or truncated
-            if channel.recv_stderr_ready():
-                stderr_size, truncated = append_limited(stderr_chunks, stderr_size, channel.recv_stderr(32768), max_bytes)
-                stderr_truncated = stderr_truncated or truncated
-            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
-                break
-            time.sleep(0.05)
-        exit_status = channel.recv_exit_status()
-        stdout_output = decode_limited(stdout_chunks, stdout_truncated)
-        stderr_output = decode_limited(stderr_chunks, stderr_truncated)
-        result.update({
-            'status': exit_status == 0,
-            'result': stdout_output or stderr_output,
-            'stdout': stdout_output,
-            'stderr': stderr_output,
-            'exit_status': exit_status,
-            'truncated': stdout_truncated or stderr_truncated,
-        })
-    except TimeoutError as error:
-        if channel is not None:
-            channel.close()
-        result.update({
-            'result': f'命令超时: {error}',
-            'error': str(error),
-            'timeout': True,
-        })
-    except Exception as error:
-        if channel is not None:
-            channel.close()
-        result.update({
-            'result': str(error),
-            'error': str(error),
-        })
+    # Bound the number of concurrent channels so a burst of parallel tool
+    # calls cannot overwhelm the target's sshd.
+    with _command_semaphore:
+        try:
+            timeout = max(1, int(timeout))
+            max_bytes = max(1024, int(max_bytes))
+            transport = client.get_transport()
+            if transport is None or (hasattr(transport, 'is_active') and not transport.is_active()):
+                raise RuntimeError('SSH 连接已断开')
+            channel = transport.open_session()
+            channel.settimeout(1)
+            channel.exec_command(command)
+            stdout_chunks = []
+            stderr_chunks = []
+            stdout_size = stderr_size = 0
+            stdout_truncated = stderr_truncated = False
+            while True:
+                progressed = False
+                # Drain every chunk currently buffered instead of one chunk per
+                # sleep interval; large command output is no longer throttled.
+                while channel.recv_ready():
+                    if time.monotonic() - started > timeout:
+                        raise TimeoutError(f'{timeout}s')
+                    stdout_size, truncated = append_limited(stdout_chunks, stdout_size, channel.recv(65536), max_bytes)
+                    stdout_truncated = stdout_truncated or truncated
+                    progressed = True
+                while channel.recv_stderr_ready():
+                    if time.monotonic() - started > timeout:
+                        raise TimeoutError(f'{timeout}s')
+                    stderr_size, truncated = append_limited(stderr_chunks, stderr_size, channel.recv_stderr(65536), max_bytes)
+                    stderr_truncated = stderr_truncated or truncated
+                    progressed = True
+                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    break
+                if time.monotonic() - started > timeout:
+                    raise TimeoutError(f'{timeout}s')
+                if not progressed:
+                    time.sleep(0.02)
+            exit_status = channel.recv_exit_status()
+            stdout_output = decode_limited(stdout_chunks, stdout_truncated)
+            stderr_output = decode_limited(stderr_chunks, stderr_truncated)
+            result.update({
+                'status': exit_status == 0,
+                'result': stdout_output or stderr_output,
+                'stdout': stdout_output,
+                'stderr': stderr_output,
+                'exit_status': exit_status,
+                'truncated': stdout_truncated or stderr_truncated,
+            })
+        except TimeoutError as error:
+            result.update({
+                'result': f'命令超时: {error}',
+                'error': str(error),
+                'timeout': True,
+            })
+        except Exception as error:
+            result.update({
+                'result': str(error),
+                'error': str(error),
+            })
+        finally:
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
     return result
 
 
@@ -434,17 +544,45 @@ def first_success(client, commands, timeout=10, max_bytes=1_000_000):
     return last_result
 
 
-def sftp_download(client, origin_path, download_path):
+def sftp_download(client, origin_path, download_path, timeout=120, max_bytes=None):
+    """Download with an idle timeout and an optional hard size limit.
+
+    paramiko's SFTPClient.get() has no timeout or size guard of its own, so a
+    stalled transfer or a file that grows after the initial stat could hang the
+    whole investigation.
+    """
     sftp = None
+    total = 0
     try:
         sftp = client.open_sftp()
-        sftp.get(origin_path, download_path)
-        return {'status': True, 'result': download_path, 'error': ''}
+        channel = sftp.get_channel() if hasattr(sftp, 'get_channel') else None
+        if channel is not None and timeout:
+            channel.settimeout(timeout)
+        with sftp.open(origin_path, 'rb') as remote_file:
+            if hasattr(remote_file, 'prefetch'):
+                remote_file.prefetch()
+            with open(download_path, 'wb') as local_file:
+                while True:
+                    chunk = remote_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise ValueError(f'文件超过下载大小限制 {max_bytes} bytes')
+                    local_file.write(chunk)
+        return {'status': True, 'result': download_path, 'error': '', 'bytes': total}
     except Exception as error:
-        return {'status': False, 'result': '', 'error': str(error)}
+        try:
+            Path(download_path).unlink()
+        except OSError:
+            pass
+        return {'status': False, 'result': '', 'error': str(error), 'bytes': total}
     finally:
         if sftp:
-            sftp.close()
+            try:
+                sftp.close()
+            except Exception:
+                pass
 
 
 def sftp_upload(client, local_path, server_path):
@@ -493,17 +631,23 @@ def get_time(parts):
     return f'{parts[2]}年{month}月{day}日'
 
 
-def get_time_path():
-    return datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-
-
 MALICIOUS_PATTERN = re.compile(
     r'bash\s+-i|/dev/tcp/|\bnc\s+|\btelnet\s+|\bcurl\s+.*\|\s*(sh|bash|python|perl)|'
     r'\bwget\s+.*\|\s*(sh|bash|python|perl)|exec\s+.*socket|base64\s+-d|'
     r'exec\(base64\.b64decode|\.decode\([\'\"]base64[\'\"]\)|php\s+-r|'
-    r'python\s+-c\s+.*socket|perl\s+-e\s+.*socket',
+    r'python\s+-c\s+.*socket|perl\s+-e\s+.*socket|powershell|cmd\.exe',
     re.IGNORECASE,
 )
+
+# Only content that looks command-like or webshell-like is worth a remote
+# SafeLine lookup; this avoids one HTTP request per line of process/strings
+# output while keeping the local regex as the first-pass filter.
+SAFELINE_HINT_PATTERN = re.compile(
+    r'(?i)(?:<\?|eval\s*\(|assert\s*\(|system\s*\(|passthru\s*\(|shell_exec\s*\(|'
+    r'base64|/dev/tcp|\bsocket\b|subprocess|os\.system|popen|'
+    r'\b(?:bash|sh|curl|wget|nc|ncat|socat|python|perl|php|powershell|chmod)\b)',
+)
+SAFELINE_MAX_INPUT = 8192
 
 
 def check_safe_local(content):
@@ -520,7 +664,13 @@ def get_safeline_server():
         if mtime == _safeline_config_mtime:
             return _safeline_server
         with open(CONFIG_PATH, encoding='utf-8') as file:
-            _safeline_server = json.load(file).get('SafeLineWAF', {}).get('Server', '').strip()
+            server = json.load(file).get('SafeLineWAF', {}).get('Server', '')
+        server = str(server or '').strip()
+        new_server = server if urlparse(server).scheme in ('http', 'https') else ''
+        if new_server != _safeline_server:
+            with _safeline_cache_lock:
+                _safeline_cache.clear()
+        _safeline_server = new_server
         _safeline_config_mtime = mtime
         return _safeline_server
     except (OSError, json.JSONDecodeError, AttributeError):
@@ -529,12 +679,72 @@ def get_safeline_server():
         return ''
 
 
-def check_safe_safeline(content):
+def check_safe_safeline_result(content, use_cache=True):
+    """Query SafeLine and preserve why a verdict could not be obtained.
+
+    Returns {'status': hit|clean|unavailable|disabled, 'content': ...,
+             'error': ..., 'http_status': ...}.
+    """
+    result = {'status': 'disabled', 'content': '', 'error': '', 'http_status': None}
     server = get_safeline_server()
-    if not server:
-        return ''
+    content = str(content or '')
+    if not server or not content:
+        result['error'] = 'SafeLine 未配置或内容为空'
+        return result
+    if len(content) > SAFELINE_MAX_INPUT:
+        content = content[:SAFELINE_MAX_INPUT]
+
+    now = time.monotonic()
+    if use_cache:
+        with _safeline_cache_lock:
+            cached = _safeline_cache.get(content)
+            if cached and now - cached[0] < cached[1]:
+                return dict(cached[2])
+
+    with _safeline_rate_lock:
+        cutoff = now - 60
+        while _safeline_request_times and _safeline_request_times[0] < cutoff:
+            _safeline_request_times.pop(0)
+        if len(_safeline_request_times) >= SAFELINE_MAX_QUERIES_PER_MINUTE:
+            result = {
+                'status': 'unavailable',
+                'content': '',
+                'error': 'SafeLine 查询频率超过限制，部分内容未检测',
+                'http_status': None,
+            }
+            return result
+        _safeline_request_times.append(now)
+
     try:
-        response = requests.get(server, params={'input': content}, timeout=5)
-        return content if response.status_code == 403 else ''
-    except requests.RequestException:
-        return ''
+        response = _safeline_session.get(server, params={'input': content}, timeout=(3, 5))
+        if response.status_code == 403:
+            result = {'status': 'hit', 'content': content, 'error': '', 'http_status': 403}
+        elif 200 <= response.status_code < 400:
+            result = {'status': 'clean', 'content': '', 'error': '', 'http_status': response.status_code}
+        else:
+            result = {
+                'status': 'unavailable',
+                'content': '',
+                'error': f'SafeLine 返回 HTTP {response.status_code}',
+                'http_status': response.status_code,
+            }
+    except requests.RequestException as error:
+        result = {
+            'status': 'unavailable',
+            'content': '',
+            'error': f'SafeLine 请求失败: {error}',
+            'http_status': None,
+        }
+
+    if use_cache:
+        ttl = SAFELINE_CACHE_TTL if result['status'] in ('hit', 'clean') else SAFELINE_UNAVAILABLE_TTL
+        with _safeline_cache_lock:
+            if len(_safeline_cache) >= SAFELINE_CACHE_MAX:
+                _safeline_cache.pop(next(iter(_safeline_cache)))
+            _safeline_cache[content] = (now, ttl, dict(result))
+    return result
+
+
+def check_safe_safeline(content):
+    result = check_safe_safeline_result(content)
+    return result['content'] if result['status'] == 'hit' else ''

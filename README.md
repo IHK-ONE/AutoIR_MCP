@@ -9,6 +9,7 @@ AutoIR_MCP 是一个基于 FastMCP 的 Linux 应急响应 MCP 服务。它通过
 ```plain
 AutoIR_MCP/
 ├── AutoIR_MCP.py              # 启动入口，运行 core.server:mcp
+├── .github/workflows/         # GitHub Actions 静态检查与单元测试
 ├── core/
 │   ├── server.py              # FastMCP app、工具注册和取证工具
 │   ├── prompts.py             # MCP instructions、工具分组和报告规范
@@ -16,6 +17,7 @@ AutoIR_MCP/
 │   └── session.py             # SSH session 状态模型
 ├── config.json                # SafeLine 检测接口配置
 ├── extensions/                # HeMa、rkhunter 等本地资产
+├── tests/                     # 标准库 unittest 回归测试
 ├── requirements.txt           # Python 依赖
 └── README.md
 ```
@@ -27,6 +29,8 @@ pip install -r requirements.txt
 python AutoIR_MCP.py
 ```
 
+需要 Python 3.10+；当前依赖版本区间已在 Python 3.12 下验证。
+
 ## 使用原则
 
 AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查路径。AI 客户端应根据用户目标、现场上下文和已有工具输出，自行决定调用哪个单个工具，并自行组织 IOC、时间线、攻击链和结论。
@@ -35,7 +39,7 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 
 ### 基础与报告
 
-- `get_ssh_client`：建立 SSH 会话。
+- `get_ssh_client`：建立 SSH 会话；支持 `verify_host_key=True` 与自定义 `known_hosts` 启用主机密钥校验。
 - `check_ssh_session`：检查 SSH 会话是否可用。
 - `close_ssh_client`：关闭当前 SSH 会话。
 - `reset_session`：重置连接和会话状态。
@@ -132,23 +136,26 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 ```json
 {
   "SafeLineWAF": {
-    "Server": "https://check.ihk-one.top/"
+    "Server": "http://check.ihk-one.top/"
   }
 }
 ```
 
-接口应接收 `input` GET 参数，命中恶意内容时返回 HTTP 403。离线环境可留空，工具会使用本地规则继续检测。
+生产环境建议使用 HTTPS；当前临时配置使用 HTTP。接口应接收 `input` GET 参数：HTTP 403 视为命中，2xx/3xx 视为未命中，其他状态码或请求异常视为不可用。可用性检查结果缓存 5 分钟，不可用结果缓存 30 秒，查询频率限制为每分钟 120 次；配置变更后缓存自动清空。离线环境可留空，工具会使用本地规则继续检测；SafeLine 不可用时工具输出会明确标注，而不是当作安全。
 
 ## 容错与安全
 
-- SSH 命令统一返回状态、stdout/stderr、退出码、超时和截断标记。
+- SSH 命令统一返回状态、stdout/stderr、退出码、超时和截断标记；并发执行有上限，避免压垮目标 sshd。
 - 常见检测提供 fallback，例如 `ss → netstat`、`ip → hostname -I`、`last/lastb → auth.log/secure`。
-- SafeLine 不可用时自动降级到本地规则，并要求报告中说明。
+- SafeLine 不可用时自动降级到本地规则，工具输出和报告必须明确标注“未经 WAF 检测”。
+- 多文件检查采用批量读取，减少 SSH 往返；每个文件保留独立退出码，权限不足不会被误报为“未发现异常”。
 - 大日志默认只分析最近 `max_lines` 行。
-- WebShell 扫描限制文件数量、单文件大小，并阻断 tar 路径穿越和链接逃逸。
+- WebShell 扫描限制文件数量、单文件大小和下载大小，阻断 tar 路径穿越、链接和设备文件，并在扫描器失败或结果无法解析时报告检测失败。
+- 远程打包、扫描和下载使用独立运行目录，失败时会清理临时压缩包；并发扫描通过锁串行化。
+- SFTP 下载带超时和硬性大小上限，失败时删除不完整文件。
 - 可疑文件画像只读取限定头部和限定 strings 片段，不整文件输出。
 - 兼容分析工具会把工具输出归一为 `status/result/data/error/meta` 结构；兼容报告工具返回可读报告文本，直接检测工具仍优先保持简洁可读。
-- 所有工具必须区分“未发现明显异常”和“检测失败”。
+- 所有工具必须区分“未发现明显异常”“检测失败”“权限不足”“输出截断”和“需人工复核”。
 
 ## AI 客户端分析与兼容报告工具
 
@@ -163,7 +170,7 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `generate_report(timeline=...)`：结构化时间线列表，建议字段为 `time`、`event`、`source`；也可直接传 `generate_timeline` 的工具结果。
 - `generate_report(iocs=...)`：结构化 IOC 字典，支持 `ips`、`domains`、`urls`、`paths`、`ports`；也可直接传 `extract_iocs` 的工具结果。
 - `generate_report(answers=...)`：专项题目、CTF 或调查问答的结构化答案，支持字典或 `question/answer` 列表。
-- `generate_report(output_mode=...)`：默认 `inline`，保持旧版完整 markdown 返回；`preview` 返回短预览；`file` 写入 `downloads/reports/<timestamp>/report.md`，并在 `result` 返回可直接展示的短报告、完整报告路径和末尾答案；`both` 同时返回完整报告和交付预览。
+- `generate_report(output_mode=...)`：默认 `both`，同时返回完整报告、交付预览并写入 `downloads/reports/<timestamp>/report.md`；`inline` 只返回完整 markdown；`preview` 返回短预览；`file` 写入报告文件，并在 `result` 返回可直接展示的短报告、完整报告路径和末尾答案。
 - `generate_report(extra_context=...)`：兼容旧调用的兜底摘要字段；不要直接传入大段原始日志，应先 `raw_log -> filter/slice -> structured_events/findings -> report`。
 - `generate_report(report_profile=...)`：调查结束前必须调用；`standard`、`executive`、`technical`、`handoff` 仅影响报告表达侧重点。
 - `generate_report(focus=...)`：声明关注方向，例如 Web、账户、持久化、挖矿；只影响报告聚焦文本，不代表已确认风险。
@@ -186,8 +193,11 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 ## 开发命令
 
 ```bash
-python -m compileall -q AutoIR_MCP.py core
+python -m compileall -q AutoIR_MCP.py core tests
+python -m unittest discover -s tests -v
+pip install pyflakes
+python -m pyflakes core AutoIR_MCP.py tests
 git diff --check
 ```
 
-当前仓库未配置单元测试或 lint 工具。
+测试使用标准库 `unittest`，不依赖网络或真实 SSH 目标。

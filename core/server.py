@@ -1,8 +1,13 @@
 from fastmcp import FastMCP
 from .functions import (
     PROJECT_ROOT,
+    SAFELINE_HINT_PATTERN,
     check_safe_local,
-    check_safe_safeline,
+    check_safe_safeline_result,
+    classify_remote_error_text,
+    classify_remote_result,
+    remote_result_issue,
+    remote_error_issue,
     exec_command,
     extract_ioc_values,
     extract_timeline_events,
@@ -12,7 +17,7 @@ from .functions import (
     IPV4_PATTERN,
     normalize_tool_result,
     get_file_list,
-    get_time_path,
+    get_run_id,
     is_safe_path,
     is_safe_tar_member,
     sftp_download,
@@ -31,7 +36,10 @@ import collections
 import ipaddress
 import re
 import shlex
+import threading
+import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 base_dir = str(PROJECT_ROOT)
@@ -45,65 +53,112 @@ mcp = FastMCP("AutoIR_MCP", instructions=MCP_INSTRUCTIONS)
 
 
 ssh_session = SSHSession(None)
+session_lock = threading.RLock()
+state_lock = threading.RLock()
+webshell_lock = threading.RLock()
+
+
+def _close_client(client):
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
+def append_warnings(output, warnings):
+    unique = list(dict.fromkeys(
+        item for item in (warnings or []) if item and item not in output
+    ))
+    if not unique:
+        return output
+    return (output + '\n' if output else '') + '\n'.join(unique)
 
 
 def check_session(probe=False):
-    global ssh_session
-    if ssh_session is None or ssh_session.client is None:
+    with session_lock:
+        session = ssh_session
+        client = session.client if session else None
+    if client is None:
         return False
     try:
-        transport = ssh_session.client.get_transport()
+        transport = client.get_transport()
         if transport is None or not transport.is_active():
             return False
         if hasattr(transport, 'is_authenticated') and not transport.is_authenticated():
             return False
         if not probe:
             return True
-        result = exec_command(ssh_session.client, 'true', timeout=5, max_bytes=1000)
+        result = exec_command(client, 'true', timeout=5, max_bytes=1000)
         return bool(result.get('status'))
     except Exception:
         return False
 
 
 @mcp.tool()
-def get_ssh_client(ip, port=22, username='root', password=''):
+def get_ssh_client(ip, port=22, username='root', password='', verify_host_key=False, known_hosts=''):
     """
     建立 SSH 会话并缓存连接，是用户提供 IP、端口、账号密码、靶机信息或应急响应题目时必须优先调用的入口工具。
     调用：看到目标 IP/账号密码/CTF 题目/应急排查任务时，不得直接根据题面回答，必须先调用本工具连接目标；所有远程检测工具前也必须先调用。
     后续：连接成功后，按用户目标调用专用 check_* / discover_* / profile_* 工具采证；交付结论、结束调查或用户要求总结前必须调用 generate_report 汇总证据。
     输出：返回连接状态和失败原因；连接失败必须在最终报告中标注检测失败或需人工复核。
+    verify_host_key=True 时启用 known_hosts 主机密钥校验；known_hosts 可指定自定义文件。
     """
 
     global ssh_session
 
-    if not ip or not isinstance(ip, str):
+    if not ip or not isinstance(ip, str) or not ip.strip():
         return {"status": False, "result": "IP地址不能为空且必须为字符串"}
 
-    if not isinstance(port, int) or port <= 0 or port > 65535:
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return {"status": False, "result": "端口必须为1-65535之间的整数"}
+    if not 1 <= port <= 65535:
         return {"status": False, "result": "端口必须为1-65535之间的整数"}
 
-    if not username or not isinstance(username, str):
+    if not username or not isinstance(username, str) or not username.strip():
         return {"status": False, "result": "用户名不能为空且必须为字符串"}
+    if password is None:
+        password = ''
+    if not isinstance(password, str):
+        return {"status": False, "result": "password 必须为字符串"}
 
+    ip = ip.strip()
+    username = username.strip()
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
+        if verify_host_key:
+            if known_hosts:
+                client.load_system_host_keys(str(known_hosts))
+            else:
+                client.load_system_host_keys()
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        else:
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(ip, port=port, username=username, password=password, timeout=30)
-        old_client = ssh_session.client if ssh_session and ssh_session.client else None
-        ssh_session = SSHSession(client)
-        if old_client:
-            try:
-                old_client.close()
-            except Exception:
-                pass
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)
+        with session_lock:
+            old_client = ssh_session.client if ssh_session and ssh_session.client else None
+            ssh_session = SSHSession(client)
+        _close_client(old_client)
         return {"status": True, "result": "SSH 连接成功"}
 
+    except paramiko.BadHostKeyException:
+        _close_client(client)
+        return {"status": False, "result": "SSH 主机密钥校验失败：目标主机密钥与 known_hosts 不匹配"}
     except paramiko.AuthenticationException:
+        _close_client(client)
         return {"status": False, "result": "SSH 认证失败：用户名或密码错误"}
     except paramiko.SSHException as e:
+        _close_client(client)
         return {"status": False, "result": f"SSH 连接错误: {str(e)}"}
     except Exception as e:
+        _close_client(client)
         return {"status": False, "result": f"SSH 连接失败: {str(e)}"}
 
 
@@ -131,12 +186,14 @@ def close_ssh_client():
     """
     global ssh_session
     try:
-        if ssh_session and ssh_session.client:
-            ssh_session.client.close()
+        with session_lock:
+            old_client = ssh_session.client if ssh_session else None
+            ssh_session = SSHSession(None)
+        _close_client(old_client)
     except Exception as error:
-        ssh_session = SSHSession(None)
+        with session_lock:
+            ssh_session = SSHSession(None)
         return {"status": False, "result": f"SSH 会话关闭异常: {error}"}
-    ssh_session = SSHSession(None)
     return {"status": True, "result": "SSH 会话已关闭"}
 
 
@@ -148,19 +205,19 @@ def reset_session(close_connection=True):
     输出：返回重置状态。
     """
     global ssh_session
-    old_client = ssh_session.client if ssh_session else None
+    with session_lock:
+        old_client = ssh_session.client if ssh_session else None
     if close_connection and old_client:
-        try:
-            old_client.close()
-        except Exception:
-            pass
-        ssh_session = SSHSession(None)
+        _close_client(old_client)
+        with session_lock:
+            ssh_session = SSHSession(None)
         return {"status": True, "result": "会话状态已重置，SSH 连接已关闭"}
-    if ssh_session is None:
-        ssh_session = SSHSession(old_client)
-    else:
-        ssh_session.client = old_client
-        ssh_session.reset_analysis_state()
+    with session_lock:
+        if ssh_session is None:
+            ssh_session = SSHSession(old_client)
+        else:
+            ssh_session.client = old_client
+            ssh_session.reset_analysis_state()
     return {"status": True, "result": "会话状态已重置，SSH 连接保持不变"}
 
 
@@ -195,10 +252,18 @@ def check_safeline():
     调用：SSH 连接成功后优先调用一次，用于后续恶意命令/请求辅助判断。
     输出：返回 WAF 存活状态。
     """
-    ssh_session.safeline_available = bool(check_safe_safeline('bash -i'))
-    if ssh_session.safeline_available:
-        return {"status": True, "result": "雷池 WAF 服务存活"}
-    return {"status": False, "result": "雷池 WAF 未存活，继续运行"}
+    result = check_safe_safeline_result('bash -i')
+    with session_lock:
+        ssh_session.safeline_available = result['status'] in ('hit', 'clean')
+        ssh_session.safeline_checked_at = time.monotonic()
+        ssh_session.safeline_error = result.get('error', '')
+    if result['status'] == 'hit':
+        return {"status": True, "result": "雷池 WAF 服务存活并检出测试命令"}
+    if result['status'] == 'clean':
+        return {"status": True, "result": "雷池 WAF 服务可达，但未拦截测试命令"}
+    if result['status'] == 'unavailable':
+        return {"status": False, "result": f"雷池 WAF 不可用: {result.get('error') or '未知错误'}"}
+    return {"status": False, "result": "雷池 WAF 未配置或配置无效"}
 
 
 @mcp.tool()
@@ -662,7 +727,7 @@ def has_public_network_ioc(iocs):
 
 
 def write_report_file(report):
-    report_dir = safe_local_subdir('downloads/reports') / get_time_path()
+    report_dir = safe_local_subdir('downloads/reports') / get_run_id()
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / 'report.md'
     index = 2
@@ -865,7 +930,6 @@ def generate_report(extra_context='', case=None, findings=None, timeline=None, i
     attack_flow = infer_attack_flow(attack_source, iocs=normalized_iocs, timeline_events=timeline_events, evidence_limit=evidence_limit)
     ioc_text = format_ioc_lines(normalized_iocs, limit=max_iocs_per_type, extraction_limit=INTERNAL_IOC_LIMIT) if include_iocs else '未启用 IOC 摘要展示'
     timeline_text = format_timeline_lines(timeline_events, limit=min(max_timeline_events, 15)) if include_timeline else '未启用时间线摘要'
-    has_attack_flow = any(stage['status'] == '发现线索' for stage in attack_flow['stages'])
     focus_line = f'- 关注方向：{focus}' if str(focus or '').strip() else '- 关注方向：未指定，按通用 Linux 应急响应组织。'
     title_line = f'- 案件标题：{case_context["title"]}' if case_context['title'] else '- 案件标题：未提供。'
     target_line = f'- 目标信息：{case_context["target"]}' if case_context['target'] else '- 目标信息：未提供。'
@@ -943,7 +1007,7 @@ def generate_report(extra_context='', case=None, findings=None, timeline=None, i
 
 ## 结构化答案
 
-{format_answers_lines(answers)}
+{format_answers_lines(normalized_answers)}
 
 ## 攻击流程分析
 
@@ -997,12 +1061,31 @@ def quote_remote_path(path):
     return shlex.quote(str(path))
 
 
-def detect_malicious_text(content, use_safeline=True):
+def detect_malicious_text(content, use_safeline=True, warnings=None):
+    content = str(content or '')
     malicious_local = check_safe_local(content)
-    if not use_safeline or not ssh_session.safeline_available:
+    if malicious_local:
         return malicious_local
-    malicious_safeline = check_safe_safeline(content)
-    return malicious_local + malicious_safeline
+    if not use_safeline:
+        return ''
+    with session_lock:
+        available = bool(
+            ssh_session.safeline_available
+            and time.monotonic() - ssh_session.safeline_checked_at < 300
+        )
+    if not available:
+        return ''
+    # Remote WAF lookups are expensive; only send command/webshell-like input.
+    if len(content) > 8192 or not SAFELINE_HINT_PATTERN.search(content):
+        return ''
+    result = check_safe_safeline_result(content)
+    if result['status'] == 'unavailable':
+        with session_lock:
+            ssh_session.safeline_error = result.get('error', '')
+        if warnings is not None and not any('SafeLine' in item for item in warnings):
+            warnings.append(f"[WARN] SafeLine 查询失败，部分内容未经过 WAF 检测: {result.get('error') or '未知错误'}")
+        return ''
+    return result['content'] if result['status'] == 'hit' else ''
 
 
 def file_md5(path):
@@ -1098,7 +1181,7 @@ def check_hijack():
         ssh_session.user_list = [file['filename'] for file in get_file_list(home_dir_result['result']).values()]
         process_files([f'/home/{user}/{f}' for user in ssh_session.user_list for f in home_files])
 
-    return '\n'.join(ssh_session.hijack_output)
+    return '\n'.join(ssh_session.hijack_output) or empty_result()
 
 
 def extract_users_from_output(output):
@@ -1106,7 +1189,7 @@ def extract_users_from_output(output):
 
 
 def get_group():
-    result = exec_command(ssh_session.client, f'cat /etc/group')
+    result = exec_command(ssh_session.client, 'cat /etc/group')
     if result['status'] and result['result']:
         for line in result['result'].splitlines():
             parts = line.strip().split(':')
@@ -1115,13 +1198,22 @@ def get_group():
                 ssh_session.group_list[group_name] = [user.strip() for user in users.split(',') if user.strip()]
 
 
-def load_home_users(force=False):
-    if ssh_session.user_list and not force:
-        return ssh_session.user_list
+def load_home_users(force=False, warnings=None):
+    with state_lock:
+        if ssh_session.user_list and not force:
+            return list(ssh_session.user_list)
     result = exec_command(ssh_session.client, 'ls -al /home')
-    if result['status'] and result['result']:
-        ssh_session.user_list = [file['filename'] for file in get_file_list(result['result']).values()]
-    return ssh_session.user_list
+    kind = classify_remote_result(result)
+    users = []
+    if kind == 'ok':
+        users = [file['filename'] for file in get_file_list(result['result']).values()]
+    elif kind != 'not_found' and warnings is not None:
+        warnings.append(remote_result_issue(result, '/home', '列出用户目录'))
+    with state_lock:
+        if users:
+            ssh_session.user_list = users
+        ssh_session.user_list_time = time.monotonic()
+        return list(ssh_session.user_list)
 
 
 @mcp.tool()
@@ -1135,7 +1227,9 @@ def check_home():
     if not check_session():
         return SESSION_ERROR
 
-    return '\n'.join(load_home_users())
+    warnings = []
+    users = load_home_users(warnings=warnings)
+    return append_warnings('\n'.join(users) or empty_result('未发现 /home 用户目录'), warnings)
 
 
 @mcp.tool()
@@ -1148,21 +1242,20 @@ def check_history():
 
     if not check_session():
         return SESSION_ERROR
+    warnings = []
     output = []
+    users = load_home_users(warnings=warnings)
+    paths = ['/root/.bash_history'] + [f'/home/{user}/.bash_history' for user in users]
 
-    if not ssh_session.user_list:
-        load_home_users()
+    for entry in read_remote_files(paths, warnings=warnings):
+        if entry['status'] != 'ok':
+            continue
+        if entry['content'].strip():
+            output.append(f'[!] 存在 bash_history: {entry["path"]}')
+        else:
+            output.append(f'[i] bash_history 为空: {entry["path"]}')
 
-    result = exec_command(ssh_session.client, f'cat /root/.bash_history')
-    if result['status'] and result['result']:
-        output.append(f'[!] 存在 bash_history: /root/.bash_history')
-
-    for user in ssh_session.user_list:
-        result = exec_command(ssh_session.client, f'cat /home/{user}/.bash_history')
-        if result['status'] and result['result']:
-            output.append(f'[!] 存在 bash_history: /home/{user}/.bash_history')
-
-    return '\n'.join(output)
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -1176,10 +1269,14 @@ def check_passwd():
     if not check_session():
         return SESSION_ERROR
 
-    result = exec_command(ssh_session.client, f'cat /etc/passwd')
+    result = exec_command(ssh_session.client, 'cat /etc/passwd')
     output = []
+    kind = classify_remote_result(result)
+    if kind != 'ok':
+        issue = remote_result_issue(result, '/etc/passwd', '读取', include_missing=True)
+        return issue or command_failure(result, '/etc/passwd 读取失败')
 
-    if result['status'] and result['result']:
+    if result['result']:
         for line in result['result'].splitlines():
             parts = line.strip().split(':')
             if len(parts) >= 7:
@@ -1197,9 +1294,9 @@ def check_passwd():
                     issues.append('特权用户')
 
                 if issues:
-                    output.append(f'user: {user_name}\t"shell: {user_shell}\t[!] {"、".join(issues)}')
+                    output.append(f'user: {user_name}\tshell: {user_shell}\t[!] {"、".join(issues)}')
 
-    return '\n'.join(output)
+    return '\n'.join(output) or empty_result()
 
 
 @mcp.tool()
@@ -1213,32 +1310,40 @@ def check_ssh_keys():
     if not check_session():
         return SESSION_ERROR
 
+    warnings = []
     output = []
+    users = load_home_users(warnings=warnings)
+    dirs = ['/root/.ssh'] + [f'/home/{user}/.ssh' for user in users]
+    key_paths = []
+    for directory in dirs:
+        key_paths.extend([f'{directory}/authorized_keys', f'{directory}/authorized_keys2'])
 
-    if not ssh_session.user_list:
-        load_home_users()
+    for entry in read_remote_files(key_paths, warnings=warnings):
+        if entry['status'] != 'ok':
+            continue
+        key_users = ', '.join(extract_users_from_output(entry['content'])) or '无注释'
+        output.append(f'{entry["path"]}\tuser list: {key_users}\t[!] 存在 SSH authorized_keys')
 
-    result = exec_command(ssh_session.client, f'cat /root/.ssh/authorized_keys')
-    if result['status'] and result['result']:
-        users = ', '.join(extract_users_from_output(result['result']))
-        output.append(f'/root/.ssh/authorized_keys\tuser list{users}\t[!] 存在 SSH authorized_keys')
+    # List other files so private keys, config edits and dropped files are
+    # visible without mislabelling every file as authorized_keys.
+    quoted_dirs = ' '.join(shlex.quote(directory) for directory in dirs)
+    command = f'for d in {quoted_dirs}; do [ -d "$d" ] && find "$d" -maxdepth 1 -type f -print; done; true'
+    result = exec_command(ssh_session.client, command, timeout=20, max_bytes=200000)
+    if result.get('stderr'):
+        kind = classify_remote_error_text(result['stderr'])
+        issue = remote_error_issue(kind, 'SSH 目录', result['stderr'], '列出')
+        if issue:
+            warnings.append(issue)
+    known_keys = {'authorized_keys', 'authorized_keys2'}
+    for line in (result.get('stdout') or '').splitlines():
+        path = line.strip()
+        if not path.startswith('/'):
+            continue
+        if Path(path).name in known_keys:
+            continue
+        output.append(f'{path}\t[i] SSH 目录文件，需复核')
 
-    result = exec_command(ssh_session.client, f'find /root/.ssh/ -type f 2>/dev/null')
-    if result['status'] and result['result']:
-        output.append(f'{result["result"]}\t[!] 存在 SSH authorized_keys')
-
-    for user in ssh_session.user_list:
-        result = exec_command(ssh_session.client, f'cat /home/{user}/.ssh/authorized_keys')
-        if result['status'] and result['result']:
-            users = ', '.join(extract_users_from_output(result['result']))
-            output.append(f'/home/{user}/.ssh/authorized_keys\tuser list：{users}\t[!] 存在 SSH authorized_keys')
-
-    for user in ssh_session.user_list:
-        result = exec_command(ssh_session.client, f'find /home/{user}/.ssh/ -type f 2>/dev/null')
-        if result['status'] and result['result']:
-            output.append(f'{result["result"]}\t[!] 存在 SSH authorized_keys')
-
-    return '\n'.join(output)
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -1252,10 +1357,14 @@ def check_shadow():
     if not check_session():
         return SESSION_ERROR
 
-    result = exec_command(ssh_session.client, f'cat /etc/shadow')
+    result = exec_command(ssh_session.client, 'cat /etc/shadow')
     output = []
+    kind = classify_remote_result(result)
+    if kind != 'ok':
+        issue = remote_result_issue(result, '/etc/shadow', '读取', include_missing=True)
+        return issue or command_failure(result, '/etc/shadow 读取失败')
 
-    if result['status'] and result['result']:
+    if result['result']:
         for line in result['result'].splitlines():
             parts = line.strip().split(':')
             if len(parts) >= 2:
@@ -1263,7 +1372,7 @@ def check_shadow():
                 if not hashcode:
                     output.append(f'user: {user_name}\t[!] 空口令账户')
 
-    return '\n'.join(output)
+    return '\n'.join(output) or empty_result()
 
 
 @mcp.tool()
@@ -1278,34 +1387,40 @@ def check_sudoers():
         return SESSION_ERROR
 
     output = []
-    result = first_success(ssh_session.client, [
-        'cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null',
-        'cat /etc/sudoers 2>/dev/null',
-    ])
+    warnings = []
 
-    if not result['status']:
-        return command_failure(result, 'sudoers 读取失败')
-    if not result['result']:
-        return empty_result()
+    paths = ['/etc/sudoers']
+    for file in get_files('/etc/sudoers.d', warnings=warnings):
+        paths.append(f'/etc/sudoers.d/{file}')
+
+    entries = read_remote_files(paths, warnings=warnings)
+    readable = [entry for entry in entries if entry['status'] == 'ok']
+    if not readable:
+        for entry in entries:
+            if entry['status'] != 'not_found':
+                issue = remote_error_issue(entry['status'], entry['path'], entry['content'], '读取')
+                return append_warnings(issue or empty_result(), warnings)
+        return append_warnings(empty_result(), warnings)
 
     get_group()
-    for line in result['result'].splitlines():
-        line = line.strip()
-        if ('ALL=(ALL)' in line or 'ALL=(root)' in line) and not line.startswith('#'):
-            parts = line.split()
-            if len(parts) > 0:
-                user_or_group = parts[0]
+    for entry in readable:
+        for line in entry['content'].splitlines():
+            line = line.strip()
+            if ('ALL=(ALL)' in line or 'ALL=(root)' in line) and not line.startswith('#'):
+                parts = line.split()
+                if len(parts) > 0:
+                    user_or_group = parts[0]
 
-                if user_or_group.startswith('%'):
-                    group_name = user_or_group[1:]
-                    users_in_group = ssh_session.group_list.get(group_name, [])
-                    tmp = f'group: {group_name}\tuser: {", ".join(users_in_group)}'
-                    output.append(f'{tmp}\t[!] sudo 权限组异常')
-                else:
-                    tmp = f'{"user: " + user_or_group}'
-                    output.append(f'{tmp}\t[!] sudo 权限组异常')
+                    if user_or_group.startswith('%'):
+                        group_name = user_or_group[1:]
+                        users_in_group = ssh_session.group_list.get(group_name, [])
+                        tmp = f'group: {group_name}\tuser: {", ".join(users_in_group)}'
+                        output.append(f'{tmp}\t[!] sudo 权限组异常')
+                    else:
+                        tmp = f'{"user: " + user_or_group}'
+                        output.append(f'{tmp}\t[!] sudo 权限组异常')
 
-    return '\n'.join(output) or empty_result()
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
 
 
 privilege_escalation = ['aa-exec', 'aoss', 'apt-get', 'apt', 'ash', 'at', 'awk',
@@ -1343,8 +1458,10 @@ def parse_ps_output(output):
 
             pid = int(parts[1])
             command = ' '.join(parts[10:])
-            exe = command.split()[0]
-            if ':' in exe:
+            exe = command.split()[0] if command.strip() else ''
+            if exe.startswith('[') and exe.endswith(']'):
+                exe = exe[1:-1]
+            elif ':' in exe and '/' not in exe:
                 exe = exe.split(':')[0]
             elif '/' in exe:
                 exe = Path(exe).name
@@ -1364,26 +1481,44 @@ def parse_ps_output(output):
     return processes
 
 
+PROCESS_SNAPSHOT_TTL = 60
+
+
 def load_processes():
-    ssh_session.ps = {}
     result = exec_command(ssh_session.client, 'ps -aux')
+    processes = {}
     if result['status'] and result['result']:
-        ssh_session.ps = parse_ps_output(result['result'])
-    return len(ssh_session.ps)
+        processes = parse_ps_output(result['result'])
+    with state_lock:
+        ssh_session.ps = processes
+        ssh_session.ps_time = time.monotonic() if processes else 0.0
+        return len(processes)
+
+
+def ensure_processes(max_age=PROCESS_SNAPSHOT_TTL):
+    with state_lock:
+        fresh = bool(ssh_session.ps) and time.monotonic() - ssh_session.ps_time <= max_age
+        count = len(ssh_session.ps)
+    if fresh:
+        return count
+    return load_processes()
 
 
 @mcp.tool()
-def get_ps():
+def get_ps(force=False):
     """
     采集进程快照。
-    调用：进程类检测前优先调用；后续 check_mine、check_exec、check_pid、check_exe 复用该快照。
-    输出：返回采集到的进程数量。
+    调用：进程类检测前优先调用；后续 check_mine、check_exec、check_pid、check_exe 复用该快照，超过 60 秒自动刷新。
+    输出：返回采集到的进程数量；采集失败时返回明确失败原因。
     """
 
     if not check_session():
         return SESSION_ERROR
 
-    return f"已获取 {load_processes()} 个进程信息"
+    count = load_processes() if force or not ssh_session.ps else ensure_processes()
+    if not count:
+        return command_failure({'error': '进程快照为空'}, '进程快照获取失败')
+    return f"已获取 {count} 个进程信息"
 
 
 @mcp.tool()
@@ -1397,11 +1532,14 @@ def check_mine():
     if not check_session():
         return SESSION_ERROR
 
-    if not ssh_session.ps:
-        load_processes()
+    ensure_processes()
+    with state_lock:
+        processes = dict(ssh_session.ps)
+    if not processes:
+        return command_failure({'error': '进程快照为空，无法检测资源占用'}, '进程快照获取失败')
 
     output = ''
-    for pid, proc in ssh_session.ps.items():
+    for pid, proc in processes.items():
         cpu, mem, command = proc['cpu'], proc['mem'], proc['command']
         if cpu > 50.0 or mem > 50.0:
             output += f'PID: {pid}\tCPU: {cpu}\tMEM: {mem}\tCOMMAND: {command}\t[!] "疑似挖矿脚本，cpu/mem 占用超过 50%", "red"\n'
@@ -1419,13 +1557,16 @@ def check_exec():
     if not check_session():
         return SESSION_ERROR
 
-    if not ssh_session.ps:
-        load_processes()
+    ensure_processes()
+    with state_lock:
+        processes = dict(ssh_session.ps)
+    if not processes:
+        return command_failure({'error': '进程快照为空，无法检测可疑命令执行'}, '进程快照获取失败')
 
     output = ''
     root_command = []
 
-    for pid, proc in ssh_session.ps.items():
+    for pid, proc in processes.items():
         user, tty, command, exe = proc['user'], proc['tty'], proc['command'], proc['exe']
         reasons = []
 
@@ -1462,24 +1603,32 @@ def check_pid():
     if not check_session():
         return SESSION_ERROR
 
-    if not ssh_session.ps:
-        load_processes()
+    ensure_processes()
+    with state_lock:
+        processes = dict(ssh_session.ps)
+    if not processes:
+        return command_failure({'error': '进程快照为空，无法比对隐藏 PID'}, '进程快照获取失败')
 
     output = ''
 
     result_pid = exec_command(ssh_session.client, 'ls /proc')
     result_self = exec_command(ssh_session.client, 'ls -al /proc/self')
+    if not result_pid['status'] or not result_self['status']:
+        failed = result_pid if not result_pid['status'] else result_self
+        return command_failure(failed, '/proc 枚举失败')
 
-    if result_pid['status'] and result_self['status']:
-        try:
-            current_pid = re.findall(r'(\d+)', result_pid['result'])  # 确定所有 pid
-            self_pid = re.search(r'-> (\d+)', result_self['result']).group(1)  # 匹配 self 的 pid
+    try:
+        current_pid = re.findall(r'(\d+)', result_pid['result'])  # 确定所有 pid
+        self_match = re.search(r'-> (\d+)', result_self['result'])
+        if not self_match:
+            return command_failure(result_self, '/proc/self 解析失败')
+        self_pid = self_match.group(1)  # 匹配 self 的 pid
 
-            for pid in current_pid:
-                if int(pid) not in ssh_session.ps and (int(pid) not in range(int(self_pid) - 2, int(self_pid) + 2)):
-                    output += f'PID: {pid}\t path:/proc/{pid}\t[!] 隐藏 pid\n'
-        except (AttributeError, ValueError):
-            pass
+        for pid in current_pid:
+            if int(pid) not in processes and (int(pid) not in range(int(self_pid) - 2, int(self_pid) + 2)):
+                output += f'PID: {pid}\t path:/proc/{pid}\t[!] 隐藏 pid\n'
+    except (AttributeError, ValueError):
+        return command_failure({'error': '/proc 输出解析失败'}, '隐藏 PID 检测失败')
 
     return output or empty_result()
 
@@ -1496,23 +1645,29 @@ def check_exe():
         return SESSION_ERROR
 
     output = ''
-    if ssh_session.ps.keys():
+    ensure_processes()
+    with state_lock:
+        processes = dict(ssh_session.ps)
 
-        result = exec_command(ssh_session.client, f'ls -al /proc/*/exe 2>/dev/null')
-        if result['status'] and result['result']:
-            try:
-                group = re.findall(r'.*/proc/(\d+)/exe -> (.*)', result['result'])
-                for item in group:
-                    pid = item[0]
-                    true_exe = Path(item[1]).name  # exe 真实指向命令
-                    if int(pid) in ssh_session.ps:
-                        exe = ssh_session.ps[int(pid)]['exe']
+    result = exec_command(ssh_session.client, 'ls -al /proc/*/exe 2>/dev/null')
+    if not result['status'] and not result['result']:
+        return command_failure(result, '/proc exe 读取失败')
+    if result['status'] and result['result']:
+        try:
+            group = re.findall(r'.*/proc/(\d+)/exe -> (.*)', result['result'])
+            for item in group:
+                pid = item[0]
+                true_exe = Path(item[1]).name  # exe 真实指向命令
+                if int(pid) in processes:
+                    exe = processes[int(pid)]['exe']
 
-                        if true_exe != exe:
-                            output += f'PID: {pid}\ttrue_exe: {true_exe}\texe: {exe}\t[!] 进程名与真实可执行文件不一致，需结合上下文复核\n'
-            except ValueError:
-                pass
+                    if true_exe != exe:
+                        output += f'PID: {pid}\ttrue_exe: {true_exe}\texe: {exe}\t[!] 进程名与真实可执行文件不一致，需结合上下文复核\n'
+        except ValueError:
+            pass
 
+    if not output and not processes:
+        return command_failure({'error': '进程快照为空，无法比对可执行文件'}, '/proc exe 比对失败')
     return output or empty_result()
 
 
@@ -1529,7 +1684,7 @@ def check_mount():
 
     output = ''
 
-    result = exec_command(ssh_session.client, f'cat /proc/mounts')
+    result = exec_command(ssh_session.client, 'cat /proc/mounts')
     if not result['status']:
         return command_failure(result, '挂载信息读取失败')
     if not result['result']:
@@ -1555,29 +1710,54 @@ def get_localhost():
     if not check_session():
         return SESSION_ERROR
 
-    ssh_session.ip_list = ["127.0.0.1", "localhost", "0.0.0.0"]
+    ip_list = ["127.0.0.1", "localhost", "0.0.0.0"]
+    with state_lock:
+        ssh_session.ip_list_time = 0.0
     result = first_success(ssh_session.client, ['ip -4 addr show', 'hostname -I'])
 
     if not result['status']:
         return command_failure(result, '本地 IP 获取失败')
     if not result['result']:
-        return f"本地IP列表: {', '.join(ssh_session.ip_list)}"
+        with state_lock:
+            ssh_session.ip_list = list(ip_list)
+            ssh_session.ip_list_time = time.monotonic()
+        return f"本地IP列表: {', '.join(ip_list)}"
 
     for line in result['result'].splitlines():
         line = line.strip()
         if "inet" in line:
             try:
                 ip = re.split(r'\s+', line)[1].split('/')[0]
-                if ip not in ssh_session.ip_list:
-                    ssh_session.ip_list.append(ip)
+                if ip not in ip_list:
+                    ip_list.append(ip)
             except (IndexError, ValueError):
                 pass
         else:
             for ip in line.split():
-                if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', ip) and ip not in ssh_session.ip_list:
-                    ssh_session.ip_list.append(ip)
+                if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', ip) and ip not in ip_list:
+                    ip_list.append(ip)
 
-    return f"本地IP列表: {', '.join(ssh_session.ip_list)}"
+    with state_lock:
+        ssh_session.ip_list = list(ip_list)
+        ssh_session.ip_list_time = time.monotonic()
+    return f"本地IP列表: {', '.join(ip_list)}"
+
+
+def ensure_local_ips(warnings=None, max_age=60):
+    """Refresh local IPv4 addresses when the cache is empty or stale."""
+    with state_lock:
+        fresh = (
+            len(ssh_session.ip_list) > 3
+            and time.monotonic() - ssh_session.ip_list_time <= max_age
+        )
+    if fresh:
+        return True
+    result = get_localhost()
+    if isinstance(result, str) and '获取失败' in result:
+        if warnings is not None:
+            warnings.append('[WARN] 本机 IP 自动采集失败，远程连接判断可能不准确，需人工复核')
+        return False
+    return True
 
 
 def parse_socket_line(line):
@@ -1616,12 +1796,20 @@ def check_network():
         return SESSION_ERROR
 
     output = []
+    warnings = []
+
+    ensure_local_ips(warnings)
+
+    with state_lock:
+        local_ips = set(ssh_session.ip_list)
+    if len(local_ips) <= 3:
+        warnings.append('[WARN] 未采集到有效 IPv4 地址，远程连接判断可能不准确，需人工复核')
 
     result = first_success(ssh_session.client, ['ss -anutp', 'netstat -anutp 2>/dev/null'])
     if not result.get('status'):
         return command_failure(result, '网络连接获取失败')
     if not result.get('result'):
-        return empty_result()
+        return append_warnings(empty_result(), warnings)
 
     for line in result['result'].splitlines()[1:]:
         try:
@@ -1634,14 +1822,14 @@ def check_network():
             local_addr, local_port = local.rsplit(':', 1)
             remote_addr, remote_port = remote.rsplit(':', 1)
 
-            if remote_addr not in ssh_session.ip_list and remote_port != "*":
+            if remote_addr not in local_ips and remote_port != "*":
                 output.append(f'local :{local}\tremote :{remote}\tpid :{process}\t[!] 发现远程连接')
             elif local_port and local_port != "*":
                 output.append(f'local :{local}\tremote :{remote}\tpid :{process}\t[!] 发现开启端口')
         except (IndexError, ValueError):
             pass
 
-    return '\n'.join(output) or empty_result()
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -1685,11 +1873,11 @@ def check_eth():
         return SESSION_ERROR
 
     result = exec_command(ssh_session.client, 'ls /sys/class/net')
+    if not result.get('status'):
+        return command_failure(result, '网卡枚举失败')
 
-    if result.get('status'):
-        output = [f'网卡: {line.strip()}\t[!] "网卡检测"' for line in result['result'].splitlines()]
-        return '\n'.join(output)
-    return ''
+    output = [f'网卡: {line.strip()}\t[i] 网卡检测' for line in result['result'].splitlines() if line.strip()]
+    return '\n'.join(output) or empty_result('未发现网卡')
 
 
 @mcp.tool()
@@ -1704,9 +1892,13 @@ def check_hosts():
         return SESSION_ERROR
 
     output = ''
+    warnings = []
     standard_hosts = {'127.0.0.1', '127.0.1.1', '::1', 'ff02::1', 'ff02::2'}
+    ensure_local_ips(warnings)
+    with state_lock:
+        local_ips = set(ssh_session.ip_list)
 
-    result = exec_command(ssh_session.client, f'cat /etc/hosts')
+    result = exec_command(ssh_session.client, 'cat /etc/hosts')
     if not result['status']:
         return command_failure(result, 'hosts 读取失败')
     if not result['result']:
@@ -1720,13 +1912,14 @@ def check_hosts():
                 ip, *domains = parts
                 if ip in standard_hosts or not domains:
                     continue
-                if ip and ip not in ssh_session.ip_list:
-                    ssh_session.ip_list.append(ip)
+                if ip and ip not in local_ips:
                     output += f'ip: {ip}\tdomain: {"、".join(domains)}\t[!] 非本机 hosts 解析\n'
+                else:
+                    output += f'ip: {ip}\tdomain: {"、".join(domains)}\t[i] 本机地址映射，需复核\n'
         except (IndexError, ValueError):
             pass
 
-    return output or empty_result()
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -1806,9 +1999,9 @@ def check_tmp():
         return SESSION_ERROR
 
     result = first_success(ssh_session.client, [
-        "find /tmp -type f -printf '%p\t%u:%g\t%m\t%s bytes\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null",
-        'find /tmp -type f 2>/dev/null',
-    ])
+        "find /tmp -type f -printf '%p\t%u:%g\t%m\t%s bytes\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | head -n 1000",
+        'find /tmp -type f 2>/dev/null | head -n 1000',
+    ], timeout=30, max_bytes=300000)
     if not result['status']:
         return command_failure(result, '/tmp 文件扫描失败')
     if not result['result']:
@@ -1922,11 +2115,13 @@ def check_webshell(path='/var/www/html', max_files=20000):
         return SESSION_ERROR
 
     output = ''
+    if not isinstance(path, str) or not path.strip() or not path.strip().startswith('/'):
+        return "path 必须是目标主机上的绝对路径"
     try:
         max_files = max(1, min(int(max_files), 100000))
     except (TypeError, ValueError):
         max_files = 20000
-    path = path.strip() or '/var/www/html'
+    path = path.strip()
     quoted_path = quote_remote_path(path)
 
     count_result = first_success(
@@ -1957,21 +2152,38 @@ def check_webshell(path='/var/www/html', max_files=20000):
                     return 'webroot 总大小超过 500MB，请缩小扫描目录'
             except (IndexError, ValueError):
                 pass
-        remote_archive = f'/tmp/autoir_webroot_{get_time_path()}.tar.gz'
+        run_id = get_run_id()
+        remote_archive = f'/tmp/autoir_webroot_{run_id}.tar.gz'
         quoted_remote_archive = quote_remote_path(remote_archive)
-        tar_result = exec_command(ssh_session.client, f'cd {quoted_path} && tar -zcf {quoted_remote_archive} .')
-        if not tar_result['status'] and tar_result.get('stderr'):
-            return command_failure(tar_result, 'webroot 打包失败')
-        local_path = Path(base_dir) / 'downloads' / get_time_path()
-        local_path.mkdir(parents=True, exist_ok=True)
+        local_path = Path(base_dir) / 'downloads' / run_id
         archive_path = local_path / 'webroot.tar.gz'
+        download_result = {'status': False, 'error': ''}
         try:
-            sftp_download(ssh_session.client, remote_archive, str(archive_path))
+            # Packaging a large webroot routinely takes minutes; the default
+            # 10s command timeout made this tool fail on realistic sites.
+            tar_result = exec_command(
+                ssh_session.client,
+                f'tar -zcf {quoted_remote_archive} -C {quoted_path} .',
+                timeout=300,
+                max_bytes=20000,
+            )
+            if not tar_result['status']:
+                return command_failure(tar_result, 'webroot 打包失败')
+            local_path.mkdir(parents=True, exist_ok=True)
+            download_result = sftp_download(
+                ssh_session.client,
+                remote_archive,
+                str(archive_path),
+                timeout=300,
+                max_bytes=512 * 1024 * 1024,
+            )
         finally:
             exec_command(ssh_session.client, f'rm -f {quoted_remote_archive}', timeout=5, max_bytes=1000)
-        if not archive_path.exists():
-            return 'webroot 下载失败：未生成本地压缩包'
+        if not download_result.get('status') or not archive_path.exists():
+            return f'webroot 下载失败：{download_result.get("error") or "未生成本地压缩包"}'
 
+        extracted_bytes = 0
+        max_extract_bytes = 2 * 1024 * 1024 * 1024
         with tarfile.open(archive_path, 'r:gz') as tar:
             member_count = 0
             for member in tar:
@@ -1982,56 +2194,222 @@ def check_webshell(path='/var/www/html', max_files=20000):
                     server_path = path.rstrip('/') + '/' + member.name.replace('\\', '/')
                     output += f'file path: {server_path}\t[!] 路径/类型/大小异常已拦截\n'
                     continue
-                tar.extract(member, local_path)
+                extracted_bytes += max(member.size, 0)
+                if extracted_bytes > max_extract_bytes:
+                    return output + '解压后总大小超过限制 2GB，已停止解压'
+                try:
+                    tar.extract(member, local_path, filter='data')
+                except TypeError:
+                    # Python < 3.12 has no extraction filter; manual checks above
+                    # already reject links, devices, FIFOs and traversal.
+                    tar.extract(member, local_path)
 
         scanner_path = Path(base_dir) / 'extensions' / 'HeMa' / 'hm.exe'
-        try:
-            result = subprocess.run([str(scanner_path), 'scan', str(local_path)], capture_output=True, text=True,
-                                    encoding='utf-8', errors='ignore', timeout=300)
-        except subprocess.TimeoutExpired:
-            return output + '扫描器执行超时'
-        except OSError as error:
-            return output + f'扫描器执行失败: {error}'
+        if not scanner_path.is_file():
+            return output + f'扫描器不存在: {scanner_path}'
+        result_path = Path(base_dir) / 'extensions' / 'HeMa' / 'result.csv'
+        rows = []
+        # HeMa writes a shared result.csv; serialize scans so concurrent calls
+        # cannot mix each other's findings.
+        with webshell_lock:
+            try:
+                result_path.unlink()
+            except OSError:
+                pass
+            try:
+                result = subprocess.run(
+                    [str(scanner_path), 'scan', str(local_path)],
+                    capture_output=True, text=True, encoding='utf-8', errors='ignore', timeout=300,
+                )
+            except subprocess.TimeoutExpired:
+                return output + '扫描器执行超时'
+            except OSError as error:
+                return output + f'扫描器执行失败: {error}'
 
-        count = 0
-        for line in result.stdout.splitlines():
-            if "总计" in line:
-                count = int(line.replace(' ', '').split('|')[-2])
-        if count:
-            result_path = Path(base_dir) / 'extensions' / 'HeMa' / 'result.csv'
-            with open(result_path, 'r', encoding='utf-8', errors='ignore') as csvfile:
-                csv_reader = csv.reader(csvfile, delimiter=',')
-                next(csv_reader, None)  # 跳过表头
-                for row in csv_reader:
-                    suggestion, file_path = row[1], row[2]
-                    file_path = Path(file_path)
-                    server_path = str(file_path).replace(str(local_path), path.strip()).replace('\\', '/')
-                    output += f'file path: {server_path}\tmd5: {file_md5(file_path)}\t[!] 疑似 webshell 文件\n'
+            count = 0
+            summary_found = False
+            for line in result.stdout.splitlines():
+                if "总计" in line:
+                    summary_found = True
+                    try:
+                        count = int(line.replace(' ', '').split('|')[-2])
+                    except (IndexError, ValueError):
+                        count = 0
+
+            if result.returncode != 0:
+                if not result_path.exists():
+                    detail = (result.stderr or result.stdout).strip()
+                    return output + (
+                        f'扫描器执行失败 (exit {result.returncode}): '
+                        f'{truncate_text(detail, 500) or "无输出"}'
+                    )
+                output += f'[WARN] 扫描器退出码为 {result.returncode}，已尝试解析现有 result.csv，需人工复核\n'
+            if count and not result_path.exists():
+                return output + f'扫描器报告疑似 {count} 个文件，但未生成 result.csv'
+            if not summary_found and not result_path.exists():
+                detail = (result.stderr or result.stdout).strip()
+                return output + f'扫描器输出无法解析，检测结果未知: {truncate_text(detail, 500) or "无输出"}'
+
+            # Parse any result.csv even when the summary line is missing or
+            # unparsable; missing findings are worse than extra findings.
+            if result_path.exists():
+                try:
+                    csvfile = open(result_path, 'r', encoding='utf-8', errors='ignore')
+                except OSError as error:
+                    return output + f'扫描器结果读取失败: {error}'
+                with csvfile:
+                    csv_reader = csv.reader(csvfile, delimiter=',')
+                    next(csv_reader, None)  # 跳过表头
+                    rows = [row for row in csv_reader if len(row) >= 3]
+
+        for row in rows:
+            file_path = Path(row[2])
+            if not file_path.is_file():
+                continue
+            try:
+                md5 = file_md5(file_path)
+            except OSError:
+                md5 = '读取失败'
+            server_path = str(file_path).replace(str(local_path), path).replace('\\', '/')
+            output += f'file path: {server_path}\tmd5: {md5}\t[!] 疑似 webshell 文件\n'
     return output or empty_result('未发现疑似 webshell')
 
 
-def get_files(directory):
+BATCH_FILE_MARK = '\x1eAUTOIR_FILE:'
+BATCH_STATUS_MARK = '\x1eAUTOIR_STATUS:'
+BATCH_FILE_CHUNK = 40
+
+
+def get_files(directory, warnings=None):
     file_list = []
     result = exec_command(ssh_session.client, f'ls -al {quote_remote_path(directory)}')
-    if result and result.get('status') and result.get('result'):
+    kind = classify_remote_result(result)
+    if kind == 'ok':
         for file in get_file_list(result['result']).values():
             filename = file['filename']
             if '->' in filename:
                 filename = filename.split(' -> ')[0]
             file_list.append(filename)
+    elif kind != 'not_found' and warnings is not None:
+        warnings.append(remote_result_issue(result, directory, '列出目录'))
     return file_list
 
 
-def check_malicious_content(file_path):
+def parse_batched_file_output(output):
+    """Parse markers emitted by read_remote_files()."""
+    entries = []
+    current = None
+    # splitlines() treats the \x1e marker as a line boundary, so split on \n.
+    for line in (output or '').split('\n'):
+        line = line.rstrip('\r')
+        if line.startswith(BATCH_FILE_MARK) and line.endswith('\x1e'):
+            if current is not None:
+                entries.append(current)
+            payload = line[len(BATCH_FILE_MARK):-1]
+            # New batches prefix a per-call nonce so attacker-controlled file
+            # content cannot forge markers; accept legacy paths starting with /.
+            path = payload if payload.startswith('/') else payload.split(':', 1)[-1]
+            current = {'path': path, 'lines': [], 'code': None}
+        elif line.startswith(BATCH_STATUS_MARK) and line.endswith('\x1e'):
+            if current is not None:
+                payload = line[len(BATCH_STATUS_MARK):-1]
+                try:
+                    current['code'] = int(payload.split(':', 1)[-1])
+                except ValueError:
+                    current['code'] = 1
+                entries.append(current)
+                current = None
+        elif current is not None:
+            current['lines'].append(line)
+    if current is not None:
+        entries.append(current)
+    return [
+        {
+            'path': entry['path'],
+            'content': '\n'.join(entry['lines']),
+            'code': entry['code'] if entry['code'] is not None else 1,
+        }
+        for entry in entries
+    ]
+
+
+def read_remote_files(paths, warnings=None, timeout=30, max_bytes=500000):
+    """Read many remote files in few SSH round trips.
+
+    Files are read in chunks of BATCH_FILE_CHUNK with one shell command per
+    chunk. Each file gets an explicit exit code so permission failures are not
+    silently reported as clean.
+    """
+    unique_paths = list(dict.fromkeys(path for path in paths if path))
+    results = []
+    for offset in range(0, len(unique_paths), BATCH_FILE_CHUNK):
+        chunk = unique_paths[offset:offset + BATCH_FILE_CHUNK]
+        nonce = get_run_id()
+        script = []
+        for path in chunk:
+            quoted = quote_remote_path(path)
+            script.append(
+                f"printf '\\036AUTOIR_FILE:{nonce}:%s\\036\\n' {quoted}\n"
+                f"cat {quoted} 2>&1\n"
+                f"printf '\\n\\036AUTOIR_STATUS:{nonce}:%s\\036\\n' \"$?\""
+            )
+        result = exec_command(
+            ssh_session.client,
+            '\n'.join(script),
+            timeout=timeout,
+            max_bytes=max_bytes,
+        )
+        if result.get('truncated') and warnings is not None:
+            warnings.append('[TRUNCATED] 批量文件读取输出超过上限，部分文件内容可能不完整')
+        parsed = parse_batched_file_output(result.get('result', ''))
+        if not parsed:
+            kind = classify_remote_result(result)
+            if kind != 'not_found' and warnings is not None:
+                issue = remote_result_issue(result, f'{len(chunk)} 个文件', '批量读取')
+                if issue:
+                    warnings.append(issue)
+            for path in chunk:
+                results.append({
+                    'path': path,
+                    'content': '',
+                    'status': kind if kind != 'ok' else 'error',
+                    'exists': False,
+                })
+            continue
+        for entry in parsed:
+            if entry['code'] == 0:
+                status, exists = 'ok', True
+            else:
+                status = classify_remote_error_text(entry['content'])
+                exists = False
+                issue = remote_error_issue(status, entry['path'], entry['content'], '读取')
+                if issue and warnings is not None:
+                    warnings.append(issue)
+            results.append({
+                'path': entry['path'],
+                'content': entry['content'],
+                'status': status,
+                'exists': exists,
+            })
+    return results
+
+
+def check_malicious_content_batch(paths, warnings=None):
     output = ''
-    result = exec_command(ssh_session.client, f'cat {quote_remote_path(file_path)}')
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            if not line.startswith('#'):
-                malicious = detect_malicious_text(line.strip())
-                if malicious:
-                    output += f'file: {file_path}\tcontent: {malicious}\t[!] 恶意命令执行\n'
+    for entry in read_remote_files(paths, warnings=warnings):
+        if entry['status'] != 'ok':
+            continue
+        for line in entry['content'].splitlines():
+            if line.startswith('#'):
+                continue
+            malicious = detect_malicious_text(line.strip(), warnings=warnings)
+            if malicious:
+                output += f'file: {entry["path"]}\tcontent: {malicious}\t[!] 恶意命令执行\n'
     return output
+
+
+def check_malicious_content(file_path, warnings=None):
+    return check_malicious_content_batch([file_path], warnings=warnings)
 
 
 @mcp.tool()
@@ -2046,17 +2424,19 @@ def check_ld_so_preload():
         return SESSION_ERROR
 
     output = ''
+    warnings = []
 
-    result = exec_command(ssh_session.client, f'cat /etc/ld.so.preload')
-    if result['status'] and result['result']:
-        for line in result['result'].splitlines():
-            line = line.strip()
-            if line and not line.startswith('#'):
-                output += f'{line}\t[!] ld.so.preload 后门！\n'
-    elif result.get('exit_status') not in (0, 1):
-        return command_failure(result, 'ld.so.preload 读取失败')
+    for entry in read_remote_files(['/etc/ld.so.preload'], warnings=warnings):
+        if entry['status'] == 'ok':
+            for line in entry['content'].splitlines():
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    output += f'{line}\t[!] ld.so.preload 后门！\n'
+        elif entry['status'] != 'not_found':
+            issue = remote_error_issue(entry['status'], entry['path'], entry['content'], '读取')
+            return append_warnings(issue or empty_result(), warnings)
 
-    return output or empty_result()
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -2071,14 +2451,17 @@ def check_cron():
         return SESSION_ERROR
 
     output = ''
+    warnings = []
 
     cron_dirs = ['/var/spool/cron', '/etc/cron.d', '/etc/cron.daily', '/etc/cron.weekly', '/etc/cron.hourly', '/etc/cron.monthly']
+    cron_files = ['/etc/crontab']
 
     for cron_dir in cron_dirs:
-        for file in get_files(cron_dir):
-            output += check_malicious_content(f'{cron_dir}/{file}')
+        for file in get_files(cron_dir, warnings=warnings):
+            cron_files.append(f'{cron_dir}/{file}')
 
-    return output or empty_result()
+    output = check_malicious_content_batch(cron_files, warnings=warnings)
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -2094,8 +2477,10 @@ def check_ssh():
 
     output = ''
 
-    result = exec_command(ssh_session.client, 'ls -al /usr/sbin/sshd')
-    if result['status'] and result['result'] and '>' in result['result']:
+    result = exec_command(ssh_session.client, 'ls -al /usr/sbin/sshd 2>/dev/null')
+    if not result['status'] and not result['result']:
+        return command_failure(result, '/usr/sbin/sshd 检查失败')
+    if result['status'] and ' -> ' in result['result']:
         output += f'content: {result["result"]}\t[!] /usr/sbin/sshd 已被劫持\n'
 
     return output or empty_result()
@@ -2113,18 +2498,23 @@ def check_ssh_wrapper():
         return SESSION_ERROR
 
     output = ''
+    warnings = []
 
-    result = exec_command(ssh_session.client, 'strings /usr/sbin/sshd')
+    result = exec_command(ssh_session.client, 'strings -a /usr/sbin/sshd 2>/dev/null', timeout=30, max_bytes=1_000_000)
+    if not result['status'] and not result['result']:
+        return command_failure(result, 'sshd strings 提取失败')
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] sshd strings 输出超过 max_bytes，结果可能不完整')
     if result['status'] and result['result']:
         for line in result['result'].splitlines():
-            malicious = detect_malicious_text(line.strip())
+            malicious = detect_malicious_text(line.strip(), warnings=warnings)
             if malicious:
                 if '\033' in malicious:
                     output += f'file: {"/usr/sbin/sshd"}\tcontent: {malicious}\t[!] 恶意 shell 命令\n'
                 else:
                     output += f'file: {"/usr/sbin/sshd"}\tcontent: {malicious}\t[!] ssh wrapper 劫持\n'
 
-    return output or empty_result()
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -2138,8 +2528,9 @@ def check_inetd():
     if not check_session():
         return SESSION_ERROR
 
-    output = check_malicious_content('/etc/inetd.conf')
-    return output or empty_result()
+    warnings = []
+    output = check_malicious_content('/etc/inetd.conf', warnings=warnings)
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -2153,12 +2544,15 @@ def check_xinetd():
     if not check_session():
         return SESSION_ERROR
 
-    output = ''
+    warnings = []
 
-    for file in get_files('/etc/xinetd.conf/'):
-        output += check_malicious_content(f'/etc/xinetd.conf/{file}')
+    # /etc/xinetd.conf is a file; service definitions live in /etc/xinetd.d/.
+    xinetd_files = ['/etc/xinetd.conf']
+    for file in get_files('/etc/xinetd.d', warnings=warnings):
+        xinetd_files.append(f'/etc/xinetd.d/{file}')
 
-    return output or empty_result()
+    output = check_malicious_content_batch(xinetd_files, warnings=warnings)
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -2175,7 +2569,7 @@ def check_setuid():
     output = ''
 
     command = r"find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /mnt -o -path /media \) -prune -o -type f -perm -4000 -print 2>/dev/null"
-    result = exec_command(ssh_session.client, command)
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=500000)
     if not result['status']:
         return command_failure(result, 'SUID 文件扫描失败')
     if not result['result']:
@@ -2183,6 +2577,8 @@ def check_setuid():
 
     for line in result['result'].splitlines():
         output += f'command {line.strip()}\t[!] SUID 后门\n'
+    if result.get('truncated'):
+        output += '[TRUNCATED] SUID 扫描输出超过 max_bytes，结果可能不完整\n'
 
     return output or empty_result()
 
@@ -2198,19 +2594,19 @@ def check_startup():
     if not check_session():
         return SESSION_ERROR
 
-    output = ''
+    warnings = []
 
     init_paths = ['/etc/init.d', '/etc/rc.d', '/etc/systemd/system', '/usr/local/etc/rc.d']
     init_files = ['/etc/rc.local', '/usr/local/etc/rc.local', '/etc/conf.d/local.start', '/etc/inittab']
 
+    files = []
     for path in init_paths:
-        for file in get_files(path):
-            output += check_malicious_content(f'{path}/{file}')
+        for file in get_files(path, warnings=warnings):
+            files.append(f'{path}/{file}')
+    files.extend(init_files)
 
-    for file in init_files:
-        output += check_malicious_content(f'{file}')
-
-    return output or empty_result()
+    output = check_malicious_content_batch(files, warnings=warnings)
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -2224,12 +2620,11 @@ def check_profile():
     if not check_session():
         return SESSION_ERROR
 
-    output = ''
+    warnings = []
 
-    for file in get_files('/etc/profile.d'):
-        output += check_malicious_content(f'/etc/profile.d/{file}')
-
-    return output or empty_result()
+    files = [f'/etc/profile.d/{file}' for file in get_files('/etc/profile.d', warnings=warnings)]
+    output = check_malicious_content_batch(files, warnings=warnings)
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -2243,20 +2638,19 @@ def check_rc():
     if not check_session():
         return SESSION_ERROR
 
-    output = ''
+    warnings = []
 
     init_paths = ['/root/.bashrc', '/root/.tcshrc', '/root/.bash_profile', '/root/.cshrc', '/etc/bashrc',
                   '/etc/profile', '/etc/csh.login', '/etc/csh.cshrc']
     init_files = ['.bashrc', '.bash_profile', '.tcshrc', '.cshrc']
 
-    for path in init_paths:
-        output += check_malicious_content(path)
-
-    for user in load_home_users():
+    files = list(init_paths)
+    for user in load_home_users(warnings=warnings):
         for file in init_files:
-            output += check_malicious_content(f'/home/{user}/{file}')
+            files.append(f'/home/{user}/{file}')
 
-    return output or empty_result()
+    output = check_malicious_content_batch(files, warnings=warnings)
+    return append_warnings(output or empty_result(), warnings)
 
 
 pattern = re.compile(
@@ -2287,7 +2681,7 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
 
     output = [f'仅分析最近 {max_lines} 行日志']
 
-    result = exec_command(ssh_session.client, f'tail -n {int(max_lines)} {quote_remote_path(path)} 2>/dev/null')
+    result = exec_command(ssh_session.client, f'tail -n {int(max_lines)} {quote_remote_path(path)} 2>/dev/null', timeout=20)
     if not result['status']:
         return command_failure(result, '日志读取失败')
     if not result['result']:
@@ -2400,7 +2794,7 @@ def RookitUpload(install=False):
         return SESSION_ERROR
 
     local_rkhunter = Path(base_dir) / 'extensions' / 'rkhunter.gz'
-    remote_archive = f'/tmp/autoir_rkhunter_{get_time_path()}.tar.gz'
+    remote_archive = f'/tmp/autoir_rkhunter_{get_run_id()}.tar.gz'
     quoted_archive = quote_remote_path(remote_archive)
     upload_result = sftp_upload(ssh_session.client, str(local_rkhunter), remote_archive)
     if not upload_result.get('status'):
@@ -2590,10 +2984,16 @@ def check_dns_config():
     output = []
     for line in result['result'].splitlines():
         stripped = line.strip()
-        if stripped.startswith('nameserver'):
-            ip = stripped.split()[-1]
-            risk = '公共/外部 DNS 需复核' if not (ip.startswith('127.') or ip.startswith('10.') or ip.startswith('172.16.') or ip.startswith('172.17.') or ip.startswith('172.18.') or ip.startswith('172.19.') or ip.startswith('192.168.')) else 'DNS 配置'
-            output.append(f'file: /etc/resolv.conf\tcontent: {stripped}\t[!] {risk}')
+        if not stripped.startswith('nameserver'):
+            continue
+        ip = stripped.split()[-1]
+        try:
+            address = ipaddress.ip_address(ip)
+            is_local = address.is_private or address.is_loopback or address.is_link_local
+        except ValueError:
+            is_local = False
+        risk = 'DNS 配置' if is_local else '公共/外部 DNS 需复核'
+        output.append(f'file: /etc/resolv.conf\tcontent: {stripped}\t[!] {risk}')
     return '\n'.join(output) or empty_result()
 
 
@@ -2697,6 +3097,8 @@ def hash_file(path, algorithm='sha256'):
     """
     if not check_session():
         return SESSION_ERROR
+    if not isinstance(path, str) or not path.strip():
+        return "path 不能为空"
     algorithms = {'sha256': 'sha256sum', 'sha1': 'sha1sum', 'md5': 'md5sum'}
     algorithm = str(algorithm).lower().strip()
     if algorithm not in algorithms:
@@ -2806,6 +3208,8 @@ def download_file(remote_path, local_dir='downloads/evidence', max_bytes=100 * 1
         max_bytes = max(1024, min(int(max_bytes), 2 * 1024 * 1024 * 1024))
     except (TypeError, ValueError):
         max_bytes = 100 * 1024 * 1024
+    if not isinstance(local_dir, str) or not local_dir.strip():
+        local_dir = 'downloads/evidence'
     remote_path = remote_path.strip()
     quoted_remote = quote_remote_path(remote_path)
     stat_result = exec_command(ssh_session.client, f"stat -c '%s\t%n\t%s bytes\t%U:%G\t%A\t%y' {quoted_remote} 2>/dev/null", timeout=10, max_bytes=4000)
@@ -2817,10 +3221,19 @@ def download_file(remote_path, local_dir='downloads/evidence', max_bytes=100 * 1
         return {"status": False, "remote_path": remote_path, "result": "远程文件大小解析失败"}
     if remote_size > max_bytes:
         return {"status": False, "remote_path": remote_path, "size": remote_size, "max_bytes": max_bytes, "result": "远程文件超过下载大小限制"}
-    target_dir = safe_local_subdir(local_dir) / get_time_path()
+    filename = Path(remote_path.rstrip('/')).name
+    if not filename:
+        return {"status": False, "remote_path": remote_path, "result": "remote_path 必须指向文件而不是目录"}
+    target_dir = safe_local_subdir(local_dir) / get_run_id()
     target_dir.mkdir(parents=True, exist_ok=True)
-    local_path = target_dir / Path(remote_path).name
-    result = sftp_download(ssh_session.client, remote_path, str(local_path))
+    local_path = target_dir / filename
+    if local_path.exists():
+        stem, suffix = local_path.stem, local_path.suffix
+        index = 2
+        while local_path.exists():
+            local_path = target_dir / f'{stem}_{index}{suffix}'
+            index += 1
+    result = sftp_download(ssh_session.client, remote_path, str(local_path), max_bytes=max_bytes)
     return {
         "status": result.get('status'),
         "remote_path": remote_path,
@@ -2839,6 +3252,8 @@ def upload_file(local_path, remote_path):
     """
     if not check_session():
         return {"status": False, "result": SESSION_ERROR}
+    if not isinstance(local_path, str) or not local_path.strip():
+        return {"status": False, "result": "local_path 不能为空"}
     local = Path(local_path).expanduser().resolve()
     if not local.is_file():
         return {"status": False, "result": f"本地文件不存在: {local}"}
@@ -2864,7 +3279,7 @@ def collect_evidence_bundle(include_logs=True, include_files=False):
     """
     if not check_session():
         return {"status": False, "result": SESSION_ERROR}
-    bundle_dir = Path(base_dir) / 'downloads' / 'evidence_bundle' / get_time_path()
+    bundle_dir = Path(base_dir) / 'downloads' / 'evidence_bundle' / get_run_id()
     bundle_dir.mkdir(parents=True, exist_ok=True)
     commands = {
         'system.txt': "hostname; uname -a; date; uptime; cat /etc/os-release 2>/dev/null",
@@ -2879,11 +3294,27 @@ def collect_evidence_bundle(include_logs=True, include_files=False):
         commands['logs.txt'] = "tail -n 1000 /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages 2>/dev/null"
     if include_files:
         commands['tmp_files.txt'] = "find /tmp -type f -printf '%p\t%u:%g\t%m\t%s bytes\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | head -1000"
+    client = ssh_session.client
+
+    def collect(item):
+        filename, command = item
+        result = exec_command(client, command, timeout=30, max_bytes=500000)
+        return filename, command, result
+
+    # Collect in parallel; map() preserves dict order so output stays deterministic.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        collected = list(pool.map(collect, commands.items()))
+
     written = []
-    for filename, command in commands.items():
-        result = exec_command(ssh_session.client, command, timeout=30, max_bytes=500000)
+    for filename, command, result in collected:
         path = bundle_dir / filename
-        path.write_text(result.get('result', '') or result.get('error', ''), encoding='utf-8', errors='ignore')
+        header = (
+            f'# command: {command}\n'
+            f'# status: {result.get("status")} exit_status: {result.get("exit_status")} '
+            f'truncated: {result.get("truncated")} timeout: {result.get("timeout")}\n\n'
+        )
+        body = result.get('result', '') or result.get('error', '')
+        path.write_text(header + body, encoding='utf-8', errors='ignore')
         written.append(str(path))
     return {"status": True, "bundle_dir": str(bundle_dir), "files": written}
 
