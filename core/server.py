@@ -2124,23 +2124,37 @@ def check_webshell(path='/var/www/html', max_files=20000):
     path = path.strip()
     quoted_path = quote_remote_path(path)
 
-    count_result = first_success(
+    # Keep find's stderr: redirecting it to /dev/null makes permission errors
+    # and missing paths look like an empty webroot.
+    count_result = exec_command(
         ssh_session.client,
-        [
-            f"find {quoted_path} -type f -printf '.\\n' 2>/dev/null | head -n {max_files + 1} | wc -l",
-            f"find {quoted_path} -type f 2>/dev/null | head -n {max_files + 1} | wc -l",
-        ],
+        f"err=$(mktemp); find {quoted_path} -type f 2>\"$err\" | head -n {max_files + 1} | wc -l; "
+        f"head -n 5 \"$err\"; rm -f \"$err\"",
         timeout=30,
-        max_bytes=1000,
+        max_bytes=2000,
     )
-    if not count_result['status']:
+    if not count_result['status'] and not count_result['result']:
         return command_failure(count_result, 'webroot 文件计数失败')
+    lines = count_result['result'].splitlines()
     try:
-        file_count = int(count_result['result'].splitlines()[0].strip())
+        file_count = int(lines[0].strip())
     except (IndexError, ValueError):
         return command_failure(count_result, 'webroot 文件计数失败')
+
+    find_errors = '\n'.join(lines[1:]).strip()
+    if find_errors:
+        kind = classify_remote_error_text(find_errors)
+        if kind == 'not_found':
+            return f'[NOT_FOUND] webroot 路径不存在: {path}'
+        if kind == 'permission_denied':
+            output += '[PERMISSION] webroot 文件枚举权限不足，扫描范围可能不完整，需人工复核\n'
+        elif kind == 'error':
+            return remote_result_issue(
+                {'status': False, 'result': find_errors}, path, '枚举 webroot', include_missing=True
+            ) or command_failure(count_result, 'webroot 文件枚举失败')
+
     if file_count == 0:
-        return empty_result('webroot 目录未发现文件')
+        return output or empty_result('webroot 目录未发现文件')
     if file_count > max_files:
         return f'webroot 文件数量超过限制 {max_files}，请缩小扫描目录或提高 max_files'
 
@@ -2275,8 +2289,10 @@ def check_webshell(path='/var/www/html', max_files=20000):
     return output or empty_result('未发现疑似 webshell')
 
 
-BATCH_FILE_MARK = '\x1eAUTOIR_FILE:'
-BATCH_STATUS_MARK = '\x1eAUTOIR_STATUS:'
+# Printable markers survive exec_command's output stripping; the per-call
+# nonce keeps attacker-controlled file content from forging them.
+BATCH_FILE_MARK = '@@AUTOIR_FILE:'
+BATCH_STATUS_MARK = '@@AUTOIR_STATUS:'
 BATCH_FILE_CHUNK = 40
 
 
@@ -2299,20 +2315,19 @@ def parse_batched_file_output(output):
     """Parse markers emitted by read_remote_files()."""
     entries = []
     current = None
-    # splitlines() treats the \x1e marker as a line boundary, so split on \n.
     for line in (output or '').split('\n'):
         line = line.rstrip('\r')
-        if line.startswith(BATCH_FILE_MARK) and line.endswith('\x1e'):
+        if line.startswith(BATCH_FILE_MARK):
             if current is not None:
                 entries.append(current)
-            payload = line[len(BATCH_FILE_MARK):-1]
-            # New batches prefix a per-call nonce so attacker-controlled file
+            payload = line[len(BATCH_FILE_MARK):]
+            # Batches prefix a per-call nonce so attacker-controlled file
             # content cannot forge markers; accept legacy paths starting with /.
             path = payload if payload.startswith('/') else payload.split(':', 1)[-1]
             current = {'path': path, 'lines': [], 'code': None}
-        elif line.startswith(BATCH_STATUS_MARK) and line.endswith('\x1e'):
+        elif line.startswith(BATCH_STATUS_MARK):
             if current is not None:
-                payload = line[len(BATCH_STATUS_MARK):-1]
+                payload = line[len(BATCH_STATUS_MARK):]
                 try:
                     current['code'] = int(payload.split(':', 1)[-1])
                 except ValueError:
@@ -2349,9 +2364,9 @@ def read_remote_files(paths, warnings=None, timeout=30, max_bytes=500000):
         for path in chunk:
             quoted = quote_remote_path(path)
             script.append(
-                f"printf '\\036AUTOIR_FILE:{nonce}:%s\\036\\n' {quoted}\n"
+                f"printf '@@AUTOIR_FILE:{nonce}:%s\\n' {quoted}\n"
                 f"cat {quoted} 2>&1\n"
-                f"printf '\\n\\036AUTOIR_STATUS:{nonce}:%s\\036\\n' \"$?\""
+                f"printf '\\n@@AUTOIR_STATUS:{nonce}:%s\\n' \"$?\""
             )
         result = exec_command(
             ssh_session.client,
@@ -2390,6 +2405,23 @@ def read_remote_files(paths, warnings=None, timeout=30, max_bytes=500000):
                 'content': entry['content'],
                 'status': status,
                 'exists': exists,
+            })
+
+        # A large file can consume the chunk's byte budget and cut off markers
+        # for later files. Never silently drop those paths.
+        returned = {entry['path'] for entry in parsed}
+        missing = [path for path in chunk if path not in returned]
+        if missing and warnings is not None:
+            preview = ', '.join(missing[:5]) + ('...' if len(missing) > 5 else '')
+            warnings.append(
+                f'[TRUNCATED] 批量读取未返回 {len(missing)} 个文件（输出可能被截断）: {preview}'
+            )
+        for path in missing:
+            results.append({
+                'path': path,
+                'content': '',
+                'status': 'error',
+                'exists': False,
             })
     return results
 

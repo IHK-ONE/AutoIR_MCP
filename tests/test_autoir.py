@@ -293,12 +293,12 @@ class RemoteErrorTests(unittest.TestCase):
 class BatchFileParsingTests(unittest.TestCase):
     def test_parses_multiple_files_and_exit_codes(self):
         output = (
-            '\x1eAUTOIR_FILE:/etc/a\x1e\n'
+            '@@AUTOIR_FILE:/etc/a\n'
             'alpha\n'
-            '\x1eAUTOIR_STATUS:0\x1e\n'
-            '\x1eAUTOIR_FILE:/etc/b\x1e\n'
+            '@@AUTOIR_STATUS:0\n'
+            '@@AUTOIR_FILE:/etc/b\n'
             'cat: /etc/b: Permission denied\n'
-            '\x1eAUTOIR_STATUS:1\x1e\n'
+            '@@AUTOIR_STATUS:1\n'
         )
         entries = server.parse_batched_file_output(output)
 
@@ -308,15 +308,15 @@ class BatchFileParsingTests(unittest.TestCase):
         self.assertIn('Permission denied', entries[1]['content'])
 
     def test_keeps_unterminated_trailing_entry_with_failure_code(self):
-        entries = server.parse_batched_file_output('\x1eAUTOIR_FILE:/etc/a\x1e\npartial')
+        entries = server.parse_batched_file_output('@@AUTOIR_FILE:/etc/a\npartial')
 
         self.assertEqual(entries[0]['code'], 1)
 
     def test_nonce_prefix_is_stripped(self):
         output = (
-            '\x1eAUTOIR_FILE:run-123:/etc/a\x1e\n'
+            '@@AUTOIR_FILE:run-123:/etc/a\n'
             'alpha\n'
-            '\x1eAUTOIR_STATUS:run-123:0\x1e\n'
+            '@@AUTOIR_STATUS:run-123:0\n'
         )
         entries = server.parse_batched_file_output(output)
 
@@ -423,6 +423,21 @@ class PermissionPropagationTests(unittest.TestCase):
 
         self.assertNotIn('[PERMISSION]', output)
         self.assertNotIn('[FAILED]', output)
+
+    def test_missing_batch_entries_are_not_silently_dropped(self):
+        output = (
+            b'@@AUTOIR_FILE:run-1:/etc/a\n'
+            b'alpha\n'
+            b'@@AUTOIR_STATUS:run-1:0\n'
+        )
+        channel = FakeChannel([output], exit_status=0)
+        server.ssh_session.client = FakeClient(channel)
+        warnings = []
+
+        entries = server.read_remote_files(['/etc/a', '/etc/b'], warnings=warnings)
+
+        self.assertEqual([entry['status'] for entry in entries], ['ok', 'error'])
+        self.assertTrue(any('[TRUNCATED]' in warning for warning in warnings))
 
 
 if __name__ == '__main__':
