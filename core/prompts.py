@@ -21,11 +21,12 @@ TOOL_CATEGORIES = {
     ],
     "文件/WebShell": [
         "check_bin", "check_tmp", "check_recent_files", "check_package_integrity",
-        "discover_webroots", "check_webshell",
+        "discover_webroots", "check_web_persistence", "check_webshell",
     ],
     "后门/持久化": [
         "check_hijack", "check_ld_so_preload", "check_env_preload", "check_alias",
         "check_cron", "check_user_crontabs", "check_at_jobs", "check_ssh", "check_ssh_wrapper",
+        "check_pam", "check_sshd_config",
         "check_inetd", "check_xinetd", "check_setuid", "check_startup", "check_profile",
         "check_rc", "check_fstab", "check_systemd_timers", "check_service_execstart",
     ],
@@ -35,8 +36,9 @@ TOOL_CATEGORIES = {
     ],
     "日志": [
         "check_log", "check_web_logs_auto", "check_login_success", "check_login_fail",
+        "check_login_sessions",
     ],
-    "Rootkit": ["RootkitUpload"],
+    "Rootkit": ["RootkitUpload", "check_kernel_modules"],
 }
 
 

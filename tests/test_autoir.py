@@ -663,6 +663,86 @@ class IncidentResponseHeuristicTests(unittest.TestCase):
         self.assertIn('未检测到 rpm/dpkg', output)
         self.assertIn('需人工复核', output)
 
+    def test_pam_line_finding_flags_exec_and_nullok(self):
+        self.assertIn('[!]', server.pam_line_finding('auth optional pam_exec.so /tmp/x.sh'))
+        self.assertIn('[!]', server.pam_line_finding('auth sufficient pam_unix.so nullok'))
+        self.assertIn('[!]', server.pam_line_finding('auth include /tmp/pam_backdoor'))
+        self.assertIsNone(server.pam_line_finding('auth required pam_unix.so'))
+        self.assertIsNone(server.pam_line_finding('# auth optional pam_exec.so /tmp/x.sh'))
+
+    def test_sshd_config_finding_flags_command_hooks(self):
+        self.assertIn('AuthorizedKeysCommand', server.sshd_config_finding('AuthorizedKeysCommand /tmp/keys %u'))
+        self.assertIn('临时目录', server.sshd_config_finding('AuthorizedKeysFile /tmp/authorized_keys'))
+        self.assertIn('ForceCommand', server.sshd_config_finding('ForceCommand /tmp/backdoor'))
+        self.assertIn('非标准 SSH 端口', server.sshd_config_finding('Port 2222'))
+        self.assertIsNone(server.sshd_config_finding('PermitRootLogin no'))
+        self.assertIsNone(server.sshd_config_finding('# AuthorizedKeysCommand /tmp/keys'))
+
+    def test_kernel_taint_and_module_tags(self):
+        taint = server.decode_kernel_taint(str((1 << 12) | (1 << 13)))
+        self.assertTrue(any('树外' in line for line in taint))
+        self.assertTrue(any('未签名' in line for line in taint))
+        self.assertIn('[!]', server.kernel_module_tag('diamorphine', '/lib/modules/x.ko', 'Y'))
+        self.assertIn('[!]', server.kernel_module_tag('x', '/tmp/x.ko', 'N'))
+        self.assertIn('[i]', server.kernel_module_tag('nfs', '/lib/modules/x.ko', 'Y'))
+
+    def test_web_persistence_finding_flags_php_auto_include(self):
+        self.assertIn('[!]', server.web_persistence_finding('/var/www/.user.ini', 'auto_prepend_file=/tmp/a.php'))
+        self.assertIn('[!]', server.web_persistence_finding('/etc/php.ini', 'allow_url_include = On'))
+        self.assertIn('[!]', server.web_persistence_finding(
+            '/var/www/.htaccess', 'AddHandler application/x-httpd-php .jpg'
+        ))
+        self.assertIsNone(server.web_persistence_finding('/var/www/.htaccess', 'RewriteEngine On'))
+        self.assertIsNone(server.web_persistence_finding('/etc/php.ini', '; auto_prepend_file=/tmp/a.php'))
+
+    def test_webshell_heuristics_flag_high_signal_code(self):
+        self.assertIn('[!]', server.webshell_line_finding("system($_POST['cmd']);"))
+        self.assertIn('[!]', server.webshell_line_finding("Runtime.getRuntime().exec(request.getParameter(\"c\"));"))
+        self.assertIsNone(server.webshell_line_finding('echo "hello";'))
+        self.assertIn('[!]', server.suspicious_web_filename('/var/www/uploads/a.php.jpg'))
+        self.assertIn('[!]', server.suspicious_web_filename('/var/www/.index.php'))
+        self.assertIsNone(server.suspicious_web_filename('/var/www/index.php'))
+
+    def test_web_attack_reason_aggregation(self):
+        self.assertIn('路径穿越', server.web_attack_reason('/index.php?f=../../etc/passwd'))
+        self.assertIn('SQL 注入', server.web_attack_reason('/a.php?id=1 union select 1,2'))
+        self.assertIn('WebShell', server.web_attack_reason('/upload/shell.php'))
+        self.assertIn('扫描器', server.web_attack_reason('/ Mozilla sqlmap/1.7'))
+        self.assertIsNone(server.web_attack_reason('/index.html'))
+
+    def test_auth_correlation_flags_bruteforce_success(self):
+        correlated = server.brute_force_success_ips(
+            {'1.2.3.4': 10, '5.6.7.8': 2}, {'1.2.3.4': 1, '5.6.7.8': 1}
+        )
+        self.assertEqual(correlated, [('1.2.3.4', 10, 1)])
+        users = server.invalid_user_counts(['Invalid user admin from 1.2.3.4', 'Invalid user admin from 1.2.3.5'])
+        self.assertEqual(users, [('admin', 2)])
+
+    def test_login_sessions_reports_sshd_shape_anomalies(self):
+        nonce = 'sessnonce'
+        payload = (
+            f'@@AUTOIR_SESS:{nonce}:WHO@@\n'
+            'root pts/0 2026-10-19 10:00 (1.2.3.4)\n'
+            f'@@AUTOIR_SESS:{nonce}:LAST@@\n'
+            'root pts/0 1.2.3.4 Sun Oct 19 10:00:00 2026 still logged in\n'
+            f'@@AUTOIR_SESS:{nonce}:PS@@\n'
+            '123 1 root Sun Oct 19 10:00:00 2026 sshd: root@pts/0\n'
+            '124 123 root Sun Oct 19 10:01:00 2026 sshd: root@notty\n'
+            f'@@AUTOIR_SESS:{nonce}:NET@@\n'
+            'tcp ESTAB 0 0 10.0.0.1:22 1.2.3.4:5555 users:(("sshd",pid=124,fd=3))\n'
+        )
+        channel = FakeChannel([payload.encode()], [], exit_status=0)
+        server.ssh_session.client = FakeClient(channel)
+        try:
+            with mock.patch.object(server, 'get_run_id', return_value=nonce):
+                output = server.check_login_sessions()
+        finally:
+            server.ssh_session.client = None
+
+        self.assertIn('父进程为 1', output)
+        self.assertIn('notty', output)
+        self.assertIn('1.2.3.4:5555', output)
+
 
 if __name__ == '__main__':
     unittest.main()

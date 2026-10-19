@@ -1132,6 +1132,25 @@ def count_ips_from_lines(lines):
     return counts
 
 
+def brute_force_success_ips(failed_counts, accepted_counts, threshold=5, limit=20):
+    """Return IPs with repeated failures followed by at least one success."""
+    correlated = [
+        (ip, int(failures), int(accepted_counts.get(ip, 0)))
+        for ip, failures in failed_counts.items()
+        if failures >= threshold and accepted_counts.get(ip, 0) > 0
+    ]
+    correlated.sort(key=lambda item: (-item[1], item[0]))
+    return correlated[:limit]
+
+
+def invalid_user_counts(lines, limit=20):
+    counts = collections.Counter()
+    for line in lines:
+        for match in re.finditer(r'Invalid user\s+(\S+)', line, re.I):
+            counts[match.group(1)] += 1
+    return counts.most_common(limit)
+
+
 def format_ip_counts(counts, label, limit=50):
     if not counts:
         return ''
@@ -1546,6 +1565,247 @@ def check_sudoers():
                         output.append(f'{tmp}\t{tag}')
 
     return append_warnings('\n'.join(output) or empty_result(), warnings)
+
+
+PAM_EXEC_MODULES = {
+    'pam_exec.so': '[!] PAM 外部命令执行模块，需重点复核',
+    'pam_python.so': '[!] PAM Python 模块，需重点复核',
+    'pam_script.so': '[!] PAM 脚本模块，需重点复核',
+}
+
+
+def pam_line_finding(line):
+    """Return a review finding for dangerous PAM configuration lines."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith('#'):
+        return None
+    tokens = re.split(r'\s+', stripped)
+    controls = {token.lower() for token in tokens[:2]}
+    module = next((token for token in tokens if token.endswith('.so')), '')
+    if module in PAM_EXEC_MODULES:
+        return PAM_EXEC_MODULES[module]
+    if module == 'pam_permit.so' and 'auth' in controls:
+        return '[!] PAM 认证无条件放行模块，需重点复核'
+    if module == 'pam_unix.so' and 'nullok' in tokens:
+        return '[!] PAM 允许空口令（nullok），需重点复核'
+    include_target = tokens[-1] if tokens else ''
+    include_directive = tokens[0] == '@include' or 'include' in tokens[:2]
+    if include_directive and include_target.startswith('/'):
+        if not include_target.startswith('/etc/pam.d/'):
+            return f'[!] PAM 引用 /etc/pam.d 之外的配置文件: {include_target}'
+    return None
+
+
+@mcp.tool()
+def check_pam():
+    """
+    检查 PAM 配置中的外部命令模块和弱认证配置。
+    调用：排查 PAM 后门、登录命令执行、空口令放行或认证绕过时使用。
+    输出：返回 pam.d/pam.conf 中的命中行、文件和风险说明。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    warnings = []
+    paths = ['/etc/pam.conf']
+    for file in get_files('/etc/pam.d', warnings=warnings):
+        paths.append(f'/etc/pam.d/{file}')
+
+    output = []
+    for entry in read_remote_files(paths, warnings=warnings):
+        if entry['status'] != 'ok':
+            continue
+        for line_number, raw_line in enumerate(entry['content'].splitlines(), 1):
+            finding = pam_line_finding(raw_line)
+            if finding:
+                output.append(f'{entry["path"]}:{line_number}\t{raw_line.strip()[:200]}\t{finding}')
+
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
+
+
+def sshd_config_finding(line):
+    """Return a review finding for dangerous sshd_config directives."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith('#'):
+        return None
+    parts = stripped.split(None, 1)
+    directive = parts[0].lower()
+    value = parts[1].strip() if len(parts) > 1 else ''
+    lower_value = value.lower()
+
+    if directive == 'authorizedkeyscommand' and lower_value not in ('', 'none'):
+        return '[!] sshd 配置 AuthorizedKeysCommand，认证时会执行外部命令，需重点复核'
+    if directive == 'forcecommand' and lower_value not in ('', 'none'):
+        return '[!] sshd 配置 ForceCommand，登录后会强制执行命令，需重点复核'
+    if directive == 'permituserenvironment' and lower_value == 'yes':
+        return '[!] PermitUserEnvironment=yes，允许注入用户环境变量，需重点复核'
+    if directive == 'authorizedkeysfile':
+        if any(token in lower_value for token in ('/tmp', '/dev/shm', '/var/tmp')):
+            return f'[!] AuthorizedKeysFile 指向临时目录: {value}'
+        if lower_value not in ('', 'none') and not lower_value.endswith(('authorized_keys', 'authorized_keys2')):
+            return f'[i] AuthorizedKeysFile 使用自定义路径，需复核: {value}'
+    if directive == 'subsystem' and 'sftp' in lower_value:
+        tokens = value.split()
+        server = tokens[1] if len(tokens) > 1 else ''
+        if server and server not in ('internal-sftp', '/usr/lib/openssh/sftp-server', '/usr/libexec/openssh/sftp-server'):
+            return f'[!] SFTP 子系统使用非标准程序: {server}'
+    if directive == 'hostkey' and value.startswith('/') and not value.startswith('/etc/ssh/'):
+        return f'[!] HostKey 位于非标准路径: {value}'
+    if directive == 'include' and value.startswith('/') and not value.startswith('/etc/ssh/'):
+        return f'[!] sshd Include 指向非标准路径: {value}'
+    if directive == 'permitrootlogin' and lower_value == 'yes':
+        return '[i] PermitRootLogin=yes，需核对管理要求'
+    if directive == 'permittunnel' and lower_value in ('yes', 'point-to-point', 'ethernet'):
+        return '[i] 允许 SSH 隧道，需复核'
+    if directive == 'port' and value not in ('', '22'):
+        return f'[i] 非标准 SSH 端口: {value}'
+    return None
+
+
+@mcp.tool()
+def check_sshd_config():
+    """
+    检查 sshd 配置中的命令执行、认证绕过和持久化指令。
+    调用：排查 SSH 后门、AuthorizedKeysCommand、ForceCommand、自定义 SFTP/HostKey 时使用。
+    输出：返回 sshd_config 及 sshd_config.d 中的可疑指令和风险说明。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    warnings = []
+    paths = ['/etc/ssh/sshd_config']
+    for file in get_files('/etc/ssh/sshd_config.d', warnings=warnings):
+        paths.append(f'/etc/ssh/sshd_config.d/{file}')
+
+    output = []
+    readable = 0
+    for entry in read_remote_files(paths, warnings=warnings):
+        if entry['status'] != 'ok':
+            continue
+        readable += 1
+        for line_number, raw_line in enumerate(entry['content'].splitlines(), 1):
+            finding = sshd_config_finding(raw_line)
+            if finding:
+                output.append(f'{entry["path"]}:{line_number}\t{raw_line.strip()[:200]}\t{finding}')
+
+    if readable == 0 and not output:
+        return append_warnings(empty_result('未读取到 sshd 配置，需人工复核'), warnings)
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
+
+
+ROOTKIT_MODULE_NAMES = {
+    'diamorphine', 'reptile', 'azazel', 'suterusu', 'bdvl', 'knark', 'adore', 'adore-ng',
+    'rootkit', 'rkit', 'enyelkm', 'mokes', 'beurk',
+}
+
+
+def decode_kernel_taint(value):
+    """Decode Linux kernel taint bits that matter during incident response."""
+    try:
+        taint = int(str(value).strip())
+    except (TypeError, ValueError):
+        return []
+    reasons = []
+    if taint & (1 << 1):
+        reasons.append('[!] 内核存在强制加载模块标记（taint bit 1）')
+    if taint & (1 << 3):
+        reasons.append('[!] 内核存在强制卸载模块标记（taint bit 3）')
+    if taint & (1 << 7):
+        reasons.append('[i] 内核曾发生 die/oops（taint bit 7），需结合日志复核')
+    if taint & (1 << 9):
+        reasons.append('[i] 内核曾产生 warning（taint bit 9）')
+    if taint & (1 << 12):
+        reasons.append('[i] 已加载树外模块（taint bit 12），需核对来源')
+    if taint & (1 << 13):
+        reasons.append('[!] 已加载未签名模块（taint bit 13），需重点复核')
+    return reasons
+
+
+def kernel_module_tag(name, path, intree):
+    if name in ROOTKIT_MODULE_NAMES:
+        return '[!] 已知 rootkit 模块名，需重点复核'
+    if path and not path.startswith(('/lib/modules/', '/usr/lib/modules/')):
+        return '[!] 模块文件路径异常，需重点复核'
+    if intree == 'N':
+        return '[i] 树外模块，需核对来源'
+    return '[i] 已加载模块'
+
+
+@mcp.tool()
+def check_kernel_modules():
+    """
+    检查已加载内核模块、模块文件路径和内核 taint 标记。
+    调用：排查内核 rootkit、强制加载模块、未签名/树外模块或内核异常时使用。
+    输出：返回 lsmod 模块、modinfo 路径、intree 标记、taint 位解析和已知 rootkit 模块名。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    nonce = get_run_id()
+    taint_mark = f'@@AUTOIR_KMOD:{nonce}:TAINT@@'
+    lsmod_mark = f'@@AUTOIR_KMOD:{nonce}:LSMOD@@'
+    paths_mark = f'@@AUTOIR_KMOD:{nonce}:PATHS@@'
+    command = (
+        f"printf '{taint_mark}\\n'; cat /proc/sys/kernel/tainted 2>&1; "
+        f"printf '\\n{lsmod_mark}\\n'; lsmod 2>&1 | head -n 300; "
+        f"printf '\\n{paths_mark}\\n'; "
+        'if command -v modinfo >/dev/null 2>&1; then '
+        "lsmod 2>/dev/null | awk 'NR>1 {print $1}' | head -n 300 | while read -r m; do "
+        'f=$(modinfo -F filename "$m" 2>/dev/null); i=$(modinfo -F intree "$m" 2>/dev/null); '
+        "printf '%s\\t%s\\t%s\\n' \"$m\" \"$f\" \"$i\"; done; "
+        'else printf "modinfo unavailable\\n"; fi'
+    )
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=300000)
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, '内核模块检查失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 内核模块输出超过采集上限，结果可能不完整')
+
+    _, _, rest = text.partition(taint_mark)
+    taint_text, _, rest = rest.partition(lsmod_mark)
+    lsmod_text, _, paths_text = rest.partition(paths_mark)
+    taint_value = taint_text.strip().splitlines()[0].strip() if taint_text.strip() else ''
+
+    output = []
+    if taint_value.isdigit():
+        output.append(f'kernel taint: {taint_value}')
+        for finding in decode_kernel_taint(taint_value):
+            output.append(f'\t{finding}')
+    elif taint_value:
+        warnings.append(f'[WARN] 内核 taint 读取失败: {truncate_text(taint_value, 200)}')
+    if any(token in lsmod_text.lower() for token in ('command not found', 'not found')):
+        return append_warnings('[FAILED] lsmod 不可用，无法枚举内核模块，需人工复核', warnings)
+
+    module_paths = {}
+    intree_map = {}
+    for line in paths_text.splitlines():
+        parts = line.strip().split('\t')
+        if len(parts) >= 2 and parts[1]:
+            module_paths[parts[0]] = parts[1]
+            intree_map[parts[0]] = parts[2] if len(parts) > 2 else ''
+    modinfo_missing = 'modinfo unavailable' in paths_text
+    if modinfo_missing:
+        warnings.append('[WARN] modinfo 不可用，无法校验模块文件路径，需人工复核')
+
+    module_rows = [line for line in lsmod_text.splitlines()[1:] if line.strip()]
+    if not module_rows:
+        warnings.append('[WARN] lsmod 未返回模块列表，可能需要 root 权限或内核未启用模块')
+    for row in module_rows[:300]:
+        parts = re.split(r'\s+', row.strip())
+        name = parts[0]
+        size = parts[1] if len(parts) > 1 else '-'
+        used = parts[2] if len(parts) > 2 else '-'
+        path = module_paths.get(name, '')
+        tag = kernel_module_tag(name, path, intree_map.get(name, ''))
+        output.append(f'module: {name}\tsize: {size}\tused: {used}\tpath: {path or "-"}\t{tag}')
+
+    return append_warnings('\n'.join(output) or empty_result('未发现已加载内核模块'), warnings)
 
 
 privilege_escalation = ['aa-exec', 'aoss', 'apt-get', 'apt', 'ash', 'at', 'awk',
@@ -1989,11 +2249,16 @@ def check_network():
     if not result.get('result'):
         return append_warnings(empty_result(), warnings)
 
+    missing_process = 0
+    connection_count = 0
     for line in result['result'].splitlines()[1:]:
         try:
             socket = parse_socket_line(line)
             if not socket:
                 continue
+            connection_count += 1
+            if not socket['process']:
+                missing_process += 1
             local = socket['local']
             remote = socket['remote']
             process = socket['process'] or '-'
@@ -2007,6 +2272,11 @@ def check_network():
         except (IndexError, ValueError):
             pass
 
+    if missing_process:
+        warnings.append(
+            f'[WARN] {missing_process}/{connection_count} 条连接缺少进程信息'
+            '（非 root、hidepid 或内核限制），需人工复核'
+        )
     return append_warnings('\n'.join(output) or empty_result(), warnings)
 
 
@@ -2180,21 +2450,38 @@ def check_bin(path=''):
 
 
 def package_integrity_tag(line, manager):
-    """Classify an rpm/dpkg integrity mismatch line for review priority."""
+    """Classify an rpm/dpkg/apk integrity mismatch line for review priority."""
     stripped = line.strip()
     if not stripped:
         return None
+    system_path = any(
+        token in stripped
+        for token in ('/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/', '/lib/', '/lib64/', '/usr/lib/', '/usr/lib64/')
+    )
     if manager == 'rpm' and stripped.lower().startswith('missing'):
         return '[!] 软件包文件缺失，需重点复核'
+    if manager == 'apk':
+        # apk audit --system prints "<reason-code> <path>" for changed files.
+        match = re.match(r'^([A-Za-z])\s+(/\S.*)$', stripped)
+        if match:
+            code = match.group(1)
+            reason = {
+                'A': '新增文件', 'D': '文件缺失', 'U': '文件变更',
+                'M': '权限/元数据变更', 'C': '配置文件变更',
+            }.get(code.upper(), '文件系统审计差异')
+        elif stripped.startswith('/'):
+            reason = '文件系统审计差异'
+        else:
+            return None
+        if system_path:
+            return f'[!] 系统路径{reason}，需重点复核'
+        return f'[i] {reason}，需人工复核'
     # rpm/dpkg verification lines begin with 9 attribute characters followed by
     # whitespace. Skip database errors and other diagnostic text.
     if not re.match(r'^[\w?.]{9}\s', stripped):
         return None
     # Binaries and shared libraries are the highest-value tampering targets.
-    if any(
-        token in stripped
-        for token in ('/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/', '/lib/', '/lib64/', '/usr/lib/', '/usr/lib64/')
-    ):
+    if system_path:
         return '[!] 系统可执行文件/库与软件包记录不一致，需重点复核'
     return '[i] 文件与软件包记录不一致，需人工复核'
 
@@ -2204,7 +2491,7 @@ def check_package_integrity(max_lines=200):
     """
     校验已安装软件包的文件完整性，发现被替换或缺失的系统文件。
     调用：怀疑系统命令被替换、二进制后门或 rootkit 时使用；需要 root 权限，rpm 全量校验可能较慢。
-    输出：返回 rpm/dpkg 校验差异，系统可执行文件和库不一致会重点标注。
+    输出：返回 rpm/dpkg/apk 校验差异，系统可执行文件和库不一致会重点标注。
     """
 
     if not check_session():
@@ -2227,7 +2514,9 @@ def check_package_integrity(max_lines=200):
         'mgr=rpm; rpm -Va --noscripts >"$out" 2>"$err"; rc=$?; '
         'elif command -v dpkg >/dev/null 2>&1; then '
         'mgr=dpkg; dpkg --verify >"$out" 2>"$err"; rc=$?; '
-        'else mgr=none; : >"$out"; printf "rpm/dpkg not found\\n" >"$err"; rc=127; fi; '
+        'elif command -v apk >/dev/null 2>&1; then '
+        'mgr=apk; apk audit --system >"$out" 2>"$err"; rc=$?; '
+        'else mgr=none; : >"$out"; printf "rpm/dpkg/apk not found\\n" >"$err"; rc=127; fi; '
         f'printf "{mgr_mark}%s\\n" "$mgr"; '
         f'head -n {max_lines} "$out"; '
         f'printf "\\n{lines_mark}\\n"; '
@@ -2262,7 +2551,7 @@ def check_package_integrity(max_lines=200):
         return_code = None
 
     if manager in ('', 'none'):
-        return append_warnings('[INFO] 未检测到 rpm/dpkg，无法校验软件包完整性，需人工复核', warnings)
+        return append_warnings('[INFO] 未检测到 rpm/dpkg/apk，无法校验软件包完整性，需人工复核', warnings)
 
     lines = []
     for raw_line in body.splitlines():
@@ -2540,6 +2829,131 @@ def prune_stale_webshell_runs(max_age_days=None):
             continue
 
 
+WEBSHELL_REMOTE_GREP = (
+    r'(eval|assert|system|exec|shell_exec|passthru|popen|proc_open)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)'
+    r'|(base64_decode|gzinflate|gzuncompress|str_rot13)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)'
+    r'|(call_user_func|array_map)[[:space:]]*\([[:space:]]*\$_(POST|GET)'
+    r'|preg_replace[[:space:]]*\([^;]{0,80}/e'
+    r'|\$_(POST|GET|REQUEST|COOKIE)[[:space:]]*\[[^]]*\][[:space:]]*\('
+    r'|Runtime[.]getRuntime[[:space:]]*\([[:space:]]*\)[.]exec'
+    r'|CreateObject[[:space:]]*\([[:space:]]*["]?WScript[.]Shell'
+    r'|eval[[:space:]]*\([[:space:]]*String[.]fromCharCode'
+)
+WEBSHELL_CODE_EXTENSIONS = ('*.php', '*.php3', '*.php4', '*.php5', '*.php7', '*.php8',
+                            '*.phtml', '*.phar', '*.jsp', '*.jspx', '*.asp', '*.aspx')
+WEB_SHELL_FILENAMES = {
+    'shell.php', 'cmd.php', 'backdoor.php', 'webshell.php', 'xiaoma.php',
+    'hack.php', 'c99.php', 'r57.php', '1.php', '2.php',
+}
+
+
+def webshell_line_finding(content):
+    lower = (content or '').lower()
+    if re.search(r'\b(eval|assert|system|exec|shell_exec|passthru|popen|proc_open)\s*\(\s*\$_(post|get|request|cookie)', lower):
+        return '[!] 请求参数直接传入代码执行函数'
+    if re.search(r'\b(base64_decode|gzinflate|gzuncompress|str_rot13)\s*\(\s*\$_(post|get|request|cookie)', lower):
+        return '[!] 请求参数用于解码/解压执行'
+    if re.search(r'\b(call_user_func|array_map)\s*\(\s*\$_(post|get)', lower):
+        return '[!] 动态函数调用请求参数'
+    if re.search(r'preg_replace\s*\([^;]{0,80}/e', lower):
+        return '[!] preg_replace /e 代码执行'
+    if re.search(r'\$_(post|get|request|cookie)\s*\[[^]]*\]\s*\(', lower):
+        return '[!] 请求参数作为函数调用'
+    if re.search(r'runtime\.getruntime\s*\(\s*\)\.exec', lower):
+        return '[!] JSP Runtime.exec 命令执行'
+    if re.search(r'createobject\s*\(\s*["]?wscript\.shell', lower):
+        return '[!] ASP WScript.Shell 命令执行'
+    if re.search(r'eval\s*\(\s*string\.fromcharcode', lower):
+        return '[!] JS 编码代码执行'
+    return None
+
+
+def suspicious_web_filename(file_path):
+    normalized = (file_path or '').replace('\\', '/')
+    basename = normalized.rsplit('/', 1)[-1]
+    lower = basename.lower()
+    code_extension = r'\.(?:php\d?|phtml|phar|jsp|jspx|asp|aspx)$'
+    if lower in WEB_SHELL_FILENAMES:
+        return '[!] 命中常见 WebShell 文件名，需重点复核'
+    if lower.startswith('.') and re.search(code_extension, lower):
+        return '[!] 隐藏的 Web 脚本文件，需重点复核'
+    if re.search(r'(?:php\d?|phtml|phar|jsp|jspx|asp|aspx)\.(?:jpg|jpeg|png|gif|txt|zip|bak|old|tmp|ico)$', lower):
+        return '[!] Web 脚本伪装为其他扩展名，需重点复核'
+    if re.search(r'/(?:uploads?|wp-content/uploads)/', normalized, re.I) and re.search(code_extension, lower):
+        return '[!] 上传目录中的可执行 Web 脚本，需重点复核'
+    return None
+
+
+def remote_web_code_scan(path, max_files=5000):
+    """Heuristic remote scan used in addition to (or instead of) HeMa."""
+    nonce = get_run_id()
+    code_mark = f'@@AUTOIR_WEBSCAN:{nonce}:CODE@@'
+    name_mark = f'@@AUTOIR_WEBSCAN:{nonce}:NAME@@'
+    quoted_path = quote_remote_path(path)
+    name_expression = ' -o '.join(f"-name '{name}'" for name in WEBSHELL_CODE_EXTENSIONS)
+    command = (
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_webscan_$$.err); '
+        'list=$(mktemp 2>/dev/null || echo /tmp/autoir_webscan_$$.list); '
+        f"printf '{code_mark}\\n'; "
+        f'find {quoted_path} -maxdepth 8 -type f -size -5M \\( {name_expression} \\) '
+        '-print0 2>>"$err" > "$list"; '
+        'if [ -s "$list" ]; then '
+        f"xargs -0 grep -nHE -e '{WEBSHELL_REMOTE_GREP}' < \"$list\" 2>>\"$err\" | head -n 100; "
+        'fi; '
+        f"printf '\\n{name_mark}\\n'; "
+        f'tr \'\\0\' \'\\n\' < "$list" | head -n {int(max_files)}; '
+        f"printf '\\n{FIND_STDERR_MARK}\\n'; head -n 5 \"$err\"; rm -f \"$list\" \"$err\""
+    )
+    result = exec_command(ssh_session.client, command, timeout=180, max_bytes=600000)
+    text = result.get('result') or ''
+    if not text:
+        return [], [command_failure(result, '远程 Web 代码启发式扫描失败')]
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 远程 Web 代码扫描输出超过采集上限，结果可能不完整')
+    _, _, rest = text.partition(code_mark)
+    code_text, _, rest = rest.partition(name_mark)
+    name_text, _, error_text = rest.partition(FIND_STDERR_MARK)
+    errors = error_text.strip()
+    if 'broken pipe' in errors.lower() or 'write error' in errors.lower():
+        # head intentionally closes the pipe after enough hits.
+        errors = ''
+    if errors:
+        kind = classify_remote_error_text(errors)
+        first = errors.splitlines()[0][:200]
+        if kind == 'permission_denied':
+            warnings.append(f'[PERMISSION] 远程 Web 代码扫描权限不足，结果可能不完整: {first}')
+        elif kind != 'not_found':
+            warnings.append(f'[WARN] 远程 Web 代码扫描部分失败: {first}')
+
+    output = []
+    for line in code_text.splitlines():
+        parts = line.split(':', 2)
+        if len(parts) != 3 or not parts[0].startswith('/'):
+            continue
+        file_path, lineno, content = parts
+        finding = webshell_line_finding(content) or '[!] 远程启发式命中可疑 Web 代码'
+        output.append(
+            f'file: {file_path}\tline: {lineno}'
+            f'\tcontent: {truncate_text(content.strip(), 200)}\t{finding}'
+        )
+        if len(output) >= 100:
+            output.append('[TRUNCATED] 远程启发式命中过多，仅展示前 100 条')
+            break
+
+    seen_names = set()
+    for file_path in name_text.splitlines():
+        file_path = file_path.strip()
+        if not file_path.startswith('/') or file_path in seen_names:
+            continue
+        seen_names.add(file_path)
+        finding = suspicious_web_filename(file_path)
+        if finding:
+            output.append(f'file: {file_path}\t{finding}')
+    return output, warnings
+
+
 @mcp.tool()
 def check_webshell(path='/var/www/html', max_files=20000):
     """
@@ -2602,9 +3016,16 @@ def check_webshell(path='/var/www/html', max_files=20000):
         if size_result['status'] and size_result['result']:
             try:
                 if int(size_result['result'].splitlines()[0]) > 500 * 1024 * 1024:
-                    return 'webroot 总大小超过 500MB，请缩小扫描目录'
+                    return output + 'webroot 总大小超过 500MB，未执行打包扫描；请缩小扫描目录'
             except (IndexError, ValueError):
                 pass
+
+        heuristic_lines, heuristic_warnings = remote_web_code_scan(path, max_files)
+        for line in heuristic_lines:
+            output += line + '\n'
+        for warning in heuristic_warnings:
+            output += warning + '\n'
+
         run_id = get_run_id()
         remote_archive = f'/tmp/autoir_webroot_{run_id}.tar.gz'
         quoted_remote_archive = quote_remote_path(remote_archive)
@@ -2621,7 +3042,7 @@ def check_webshell(path='/var/www/html', max_files=20000):
                 max_bytes=20000,
             )
             if not tar_result['status']:
-                return command_failure(tar_result, 'webroot 打包失败')
+                return output + command_failure(tar_result, 'webroot 打包失败')
             local_path.mkdir(parents=True, exist_ok=True)
             download_result = sftp_download(
                 ssh_session.client,
@@ -2633,7 +3054,7 @@ def check_webshell(path='/var/www/html', max_files=20000):
         finally:
             exec_command(ssh_session.client, f'rm -f {quoted_remote_archive}', timeout=5, max_bytes=1000)
         if not download_result.get('status') or not archive_path.exists():
-            return f'webroot 下载失败：{download_result.get("error") or "未生成本地压缩包"}'
+            return output + f'webroot 下载失败：{download_result.get("error") or "未生成本地压缩包"}'
 
         try:
             extracted_bytes = 0
@@ -2659,15 +3080,17 @@ def check_webshell(path='/var/www/html', max_files=20000):
                         tar.extract(member, local_path)
 
             scanner_dir = Path(base_dir) / 'extensions' / 'HeMa'
+            scanner_names = ('hm.exe', 'hm') if os.name == 'nt' else ('hm', 'hm.exe')
             scanner_path = next(
-                (candidate for candidate in (scanner_dir / 'hm.exe', scanner_dir / 'hm') if candidate.is_file()),
+                (scanner_dir / candidate for candidate in scanner_names
+                 if (scanner_dir / candidate).is_file()),
                 None,
             )
             if scanner_path is None:
                 return (
                     output
-                    + f'扫描器不存在: {scanner_dir / "hm.exe"}'
-                    + '（当前平台无可用 HeMa 扫描器，需人工复核）'
+                    + f'扫描器不存在: {scanner_dir / scanner_names[0]}'
+                    + '（未执行 HeMa 扫描；已完成远程启发式扫描，仍建议人工复核）'
                 )
             result_path = scanner_dir / 'result.csv'
             rows = []
@@ -3058,6 +3481,130 @@ def check_xinetd():
     return append_warnings(output or empty_result(), warnings)
 
 
+def _php_directive_value(line, directive):
+    match = re.search(
+        rf'\b{re.escape(directive)}\s*(?:=|\s)\s*["\']?([^"\'\s;]+)',
+        line,
+        re.I,
+    )
+    return match.group(1) if match else ''
+
+
+def web_persistence_finding(filename, line):
+    """Detect PHP/Apache persistence directives in web or PHP config files."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith(('#', ';', '//')):
+        return None
+    basename = filename.replace('\\', '/').rsplit('/', 1)[-1].lower()
+
+    prepend = _php_directive_value(stripped, 'auto_prepend_file') or _php_directive_value(stripped, 'auto_append_file')
+    if prepend and prepend.lower() not in ('none', 'off', '0', '""', "''"):
+        directive = 'auto_prepend_file' if 'auto_prepend_file' in stripped.lower() else 'auto_append_file'
+        return f'[!] {directive} 自动包含外部文件: {prepend}'
+
+    if basename in ('php.ini', '.php.ini') or basename.endswith('.ini'):
+        if re.match(r'^\s*allow_url_include\s*=\s*(?:on|1|true|yes)\b', stripped, re.I):
+            return '[!] allow_url_include 开启，允许远程包含代码'
+        extension_dir = _php_directive_value(stripped, 'extension_dir')
+        if extension_dir and extension_dir.startswith(('/tmp/', '/var/tmp/', '/dev/shm/')):
+            return f'[!] PHP extension_dir 指向临时目录: {extension_dir}'
+        extension_match = re.match(r'^\s*extension\s*=\s*["\']?(/[^"\'\s;]+)', stripped, re.I)
+        if extension_match:
+            extension_path = extension_match.group(1)
+            if not extension_path.startswith((
+                '/usr/lib/php', '/usr/lib64/php', '/usr/local/lib/php',
+                '/usr/local/php/lib/php',
+            )):
+                return f'[!] PHP 从非标准路径加载扩展: {extension_path}'
+
+    if basename.startswith('.htaccess'):
+        if re.search(r'\bphp_(?:admin_)?value\s+auto_(?:prepend|append)_file\b', stripped, re.I):
+            return f'[!] .htaccess 配置 PHP 自动包含: {truncate_text(stripped, 200)}'
+        if re.match(r'^\s*(?:AddHandler|AddType|SetHandler)\b', stripped, re.I) and re.search(
+            r'application/x-httpd-php|php[0-9]?\b', stripped, re.I
+        ):
+            return f'[!] .htaccess 修改 PHP 处理器，上传文件可能被执行: {truncate_text(stripped, 200)}'
+        if re.match(r'^\s*php_(?:admin_)?flag\s+engine\s+on\b', stripped, re.I):
+            return '[i] .htaccess 强制开启 PHP 引擎，需结合上传目录复核'
+        if 'ExecCGI' in stripped:
+            return '[i] .htaccess 开启 ExecCGI，需结合目录用途复核'
+    return None
+
+
+@mcp.tool()
+def check_web_persistence(path='/var/www'):
+    """
+    检查 PHP/Web 配置文件中的自动包含与处理器持久化。
+    调用：排查 .user.ini、.htaccess、php.ini 中 auto_prepend_file、allow_url_include、PHP handler 等持久化时使用。
+    输出：返回文件、行号、命中内容和风险标记。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+    if not isinstance(path, str) or not path.strip().startswith('/'):
+        return 'path 必须是目标主机上的绝对路径'
+    path = path.strip()
+    quoted_path = quote_remote_path(path)
+
+    command = (
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_webpersist_$$.err); '
+        '{ for f in /etc/php.ini /etc/php/*/cli/php.ini /etc/php/*/apache2/php.ini '
+        '/etc/php/*/fpm/php.ini /etc/php/*/cgi/php.ini /etc/php/*/conf.d/*.ini '
+        '/etc/php/*/mods-available/*.ini /etc/php.d/*.ini '
+        '/usr/local/php/etc/php.ini /usr/local/etc/php/php.ini; do '
+        '[ -f "$f" ] && printf \'%s\\n\' "$f"; done; '
+        f'find {quoted_path} -maxdepth 8 -type f \\( -name \'.user.ini\' -o -name \'.htaccess\' '
+        "-o -name '.htaccess.*' -o -name 'php.ini' -o -name '.php.ini' \\) "
+        '-print 2>>"$err"; } | sort -u | head -n 300; '
+        f"printf '\\n{FIND_STDERR_MARK}\\n'; head -n 5 \"$err\"; rm -f \"$err\""
+    )
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=120000)
+    if not result['status'] and not result['result']:
+        return command_failure(result, 'Web/PHP 配置枚举失败')
+
+    data, errors = split_find_output(result['result'])
+    warnings = []
+    if errors:
+        kind = classify_remote_error_text(errors)
+        first = errors.splitlines()[0][:200]
+        if kind == 'permission_denied':
+            warnings.append(f'[PERMISSION] Web/PHP 配置枚举权限不足，结果可能不完整: {first}')
+        elif kind == 'not_found':
+            warnings.append(f'[NOT_FOUND] 站点目录不存在或不可读: {first}')
+        else:
+            warnings.append(f'[WARN] Web/PHP 配置枚举部分失败: {first}')
+
+    paths = [line.strip() for line in data.splitlines() if line.strip().startswith('/')]
+    paths = list(dict.fromkeys(paths))[:300]
+    if not paths:
+        return append_warnings(
+            empty_result('未发现 .user.ini、.htaccess 或 php.ini 配置'),
+            warnings,
+        )
+
+    output = []
+    readable = 0
+    for entry in read_remote_files(paths, warnings=warnings, timeout=60, max_bytes=600000):
+        if entry['status'] != 'ok':
+            continue
+        readable += 1
+        for lineno, line in enumerate(entry['content'].splitlines(), 1):
+            finding = web_persistence_finding(entry['path'], line)
+            if finding:
+                output.append(
+                    f'file: {entry["path"]}\tline: {lineno}'
+                    f'\tcontent: {truncate_text(line.strip(), 300)}\t{finding}'
+                )
+    if not readable:
+        return append_warnings('[FAILED] Web/PHP 配置文件均无法读取，需人工复核', warnings)
+    if not output:
+        return append_warnings(
+            empty_result(f'已检查 {readable} 个 Web/PHP 配置文件，未发现持久化特征'),
+            warnings,
+        )
+    return append_warnings('\n'.join(output), warnings)
+
+
 COMMON_SUID_SGID_PATHS = {
     '/bin/at', '/bin/chage', '/bin/expiry', '/bin/gpasswd', '/bin/mount',
     '/bin/newgrp', '/bin/passwd', '/bin/ping', '/bin/ping6', '/bin/su',
@@ -3096,7 +3643,7 @@ def check_setuid():
         'dirs=$(df -P -l 2>/dev/null | awk \'NR>1 {print $6}\' | sort -u); '
         '[ -n "$dirs" ] || dirs=/; '
         'for d in $dirs; do '
-        'case "$d" in /proc*|/sys*|/dev*|/run*|/mnt*|/media*) continue;; esac; '
+        'case "$d" in /proc*|/sys*|/mnt*|/media*) continue;; esac; '
         'find "$d" -xdev -type f \\( -perm -4000 -o -perm -2000 \\) '
         '-exec stat -c \'%A %U:%G %n\' {} + >>"$out" 2>>"$err"; '
         'done; '
@@ -3229,6 +3776,38 @@ pattern = re.compile(
     r'"(?P<user_agent>[^"]*)"'
 )
 
+WEB_ATTACK_PATTERNS = (
+    (re.compile(r'(?:\.\./|%2e%2e%2f|/etc/(?:passwd|shadow)|(?:^|\s)/proc/self/)', re.I),
+     '[!] 路径穿越/敏感文件探测'),
+    (re.compile(r'(?:union(?:\s|%20|\+)+select|information_schema|extractvalue\s*\(|updatexml\s*\()', re.I),
+     '[!] SQL 注入特征'),
+    (re.compile(r'\bsleep\s*\(\s*\d|\bbenchmark\s*\(', re.I),
+     '[!] SQL 注入/延时探测特征'),
+    (re.compile(r'(?:php://(?:input|filter)|data://|expect://|phar://)', re.I),
+     '[!] PHP 伪协议/代码执行特征'),
+    (re.compile(r'(?:;\s*|\|\s*|\$\(\s*|`\s*)(?:cat|ls|id|whoami|uname|wget|curl|bash|sh|nc|python|perl)\b', re.I),
+     '[!] 命令注入特征'),
+    (re.compile(r'(?:^|/)(?:shell|cmd|backdoor|webshell|xiaoma|hack|1)\.(?:php\d?|phtml|jsp|jspx|asp|aspx)\b', re.I),
+     '[!] 疑似 WebShell 路径访问'),
+    (re.compile(r'(?:^|/)(?:uploads?|wp-content/uploads)/[^?\s]*\.(?:php\d?|phtml|jsp|jspx|asp|aspx)\b', re.I),
+     '[!] 上传目录中的 Web 脚本访问'),
+    (re.compile(r'(?:^|/)(?:\.git/|\.env\b|wp-config\.php|phpmyadmin\b|manager/html|actuator\b|solr/|console/)', re.I),
+     '[i] 敏感路径探测'),
+)
+SCANNER_USER_AGENT = re.compile(
+    r'(?:sqlmap|nikto|nmap|masscan|dirsearch|gobuster|ffuf|wpscan|acunetix|nessus|zgrab|nuclei|xray|fscan|whatweb)',
+    re.I,
+)
+
+
+def web_attack_reason(text):
+    for regex, reason in WEB_ATTACK_PATTERNS:
+        if regex.search(text or ''):
+            return reason
+    if SCANNER_USER_AGENT.search(text or ''):
+        return '[i] 扫描器/自动化工具特征'
+    return None
+
 
 @mcp.tool()
 def check_log(path='/var/log/apache2/access.log', max_lines=5000):
@@ -3269,9 +3848,11 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
     request_success = []
     request_jump = []
     request_others = []
+    all_requests = []
     user_agents = set()
     for match in pattern.finditer(result['result']):
         request = match.groupdict()
+        all_requests.append(request)
         status = request['status']
         user_agents.add(request['user_agent'])
         if status == '200' and len(request['path']) != 1:
@@ -3309,6 +3890,27 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
 
     add_requests('\n成功访问 请求统计', request_success)
     add_requests('\n跳转访问 请求统计', request_jump)
+
+    attack_stats = {}
+    for request in all_requests:
+        reason = web_attack_reason(f'{request["path"]} {request["user_agent"]}')
+        if not reason:
+            continue
+        key = (request['ip'], reason)
+        entry = attack_stats.setdefault(key, {'count': 0, 'success': 0, 'uri': request['path']})
+        entry['count'] += 1
+        if request['status'].startswith(('2', '3')):
+            entry['success'] += 1
+    if attack_stats:
+        output.append('\nWeb 攻击特征统计')
+        ordered = sorted(attack_stats.items(), key=lambda item: (-item[1]['count'], item[0][0]))[:50]
+        for (ip, reason), entry in ordered:
+            output.append(
+                f'\tip: {ip}\tcount: {entry["count"]}\tsuccess: {entry["success"]}'
+                f'\turi: {truncate_text(entry["uri"], 200)}\t{reason}'
+            )
+        if len(attack_stats) > 50:
+            output.append(f'\t[TRUNCATED] 共 {len(attack_stats)} 组攻击特征，仅展示前 50 组')
 
     return '\n'.join(output)
 
@@ -3364,6 +3966,119 @@ def check_login_fail():
 
     output = format_ip_counts(count_ips_from_lines(result['result'].splitlines()), '爆破登入 IP')
     return output or empty_result('未发现失败登录 IP')
+
+
+SSHD_PROCESS_PATTERN = re.compile(
+    r'^\s*(\d+)\s+(\d+)\s+(\S+)\s+\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4}\s+(.*)$'
+)
+
+
+def sshd_session_finding(ppid, args):
+    """Flag sshd processes whose shape does not match a normal session."""
+    args = (args or '').strip()
+    if 'sshd:' not in args and 'sshd ' not in args:
+        return None
+    if re.search(r'\bnotty\b', args):
+        return '[i] 非交互 SSH 会话（notty），需结合登录来源与操作时间线复核'
+    if ppid in ('0', '1') and re.search(r'sshd:\s+\S+@', args):
+        return '[!] sshd 会话进程父进程为 1，可能为独立后门 sshd，需重点复核'
+    return None
+
+
+@mcp.tool()
+def check_login_sessions():
+    """
+    关联当前登录会话、历史登录、sshd 进程和已建立 SSH 连接。
+    调用：需要判断是否存在异常在线会话、隐藏登录或非交互 SSH 时使用。
+    输出：返回 who/last 会话、sshd 进程启动时间与父子关系、established SSH 连接；MCP 自身连接也会出现在结果中。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+
+    nonce = get_run_id()
+    who_mark = f'@@AUTOIR_SESS:{nonce}:WHO@@'
+    last_mark = f'@@AUTOIR_SESS:{nonce}:LAST@@'
+    ps_mark = f'@@AUTOIR_SESS:{nonce}:PS@@'
+    net_mark = f'@@AUTOIR_SESS:{nonce}:NET@@'
+    command = (
+        f"printf '{who_mark}\\n'; who -u 2>&1; "
+        f"printf '\\n{last_mark}\\n'; (last -Fai 2>/dev/null || last -f /var/log/wtmp 2>/dev/null) | head -n 40; "
+        f"printf '\\n{ps_mark}\\n'; ps -eo pid,ppid,user,lstart,args 2>/dev/null | grep '[s]shd'; "
+        f"printf '\\n{net_mark}\\n'; "
+        "(ss -tnp 2>/dev/null || netstat -tnp 2>/dev/null) | grep -E 'ESTAB|ESTABLISHED' | head -n 100"
+    )
+    result = exec_command(ssh_session.client, command, timeout=30, max_bytes=200000)
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, '登录会话信息获取失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 登录会话输出超过采集上限，结果可能不完整')
+
+    _, _, rest = text.partition(who_mark)
+    who_text, _, rest = rest.partition(last_mark)
+    last_text, _, rest = rest.partition(ps_mark)
+    ps_text, _, net_text = rest.partition(net_mark)
+
+    output = []
+    who_lines = [line for line in who_text.strip().splitlines() if line.strip()]
+    if who_lines:
+        output.append('当前登录会话（who -u）')
+        output.extend(f'\t{line}' for line in who_lines[:50])
+    else:
+        output.append('[i] who -u 未返回当前登录会话')
+
+    last_lines = [line for line in last_text.strip().splitlines() if line.strip()]
+    if last_lines:
+        output.append('\n近期登录记录（last -Fai）')
+        output.extend(f'\t{line}' for line in last_lines[:40])
+    else:
+        output.append('[i] last 未返回登录记录，可能 wtmp 不可用或已轮转')
+
+    sshd_lines = []
+    for line in ps_text.splitlines():
+        match = SSHD_PROCESS_PATTERN.match(line)
+        if not match:
+            continue
+        pid, ppid, user, args = match.groups()
+        finding = sshd_session_finding(ppid, args)
+        sshd_lines.append(
+            f'\tpid: {pid}\tppid: {ppid}\tuser: {user}\targs: {args.strip()}'
+            + (f'\t{finding}' if finding else '')
+        )
+    if sshd_lines:
+        output.append('\nsshd 进程')
+        output.extend(sshd_lines[:50])
+    else:
+        output.append('[i] 未发现 sshd 进程，若目标非 SSH 管理方式需人工复核')
+
+    connection_lines = []
+    for line in net_text.splitlines():
+        socket = parse_socket_line(line)
+        if not socket:
+            continue
+        local, remote = socket['local'], socket['remote']
+        if not re.search(r':(?:22|2222|22022)$', local) and 'sshd' not in line.lower():
+            continue
+        connection_lines.append(
+            f'\tlocal: {local}\tremote: {remote}\tstate: {socket["state"] or "-"}'
+            f'\tprocess: {socket["process"] or "-"}'
+            f'\t[i] 已建立 SSH 连接（包含 MCP 自身连接，需结合时间线复核）'
+        )
+    if connection_lines:
+        output.append('\n已建立 SSH 连接')
+        output.extend(connection_lines[:50])
+    else:
+        output.append('[i] 未发现目标端口已建立的 SSH 连接（ss/netstat 可能不可用或无权限）')
+
+    lower_net = net_text.lower()
+    if 'permission denied' in lower_net:
+        warnings.append('[PERMISSION] 连接进程信息读取权限不足，需人工复核')
+    if 'command not found' in lower_net or 'not found' in lower_net:
+        warnings.append('[WARN] ss/netstat 不可用，无法关联已建立 SSH 连接，需人工复核')
+    return append_warnings('\n'.join(output), warnings)
 
 
 def _rootkit_upload_impl(install=False):
@@ -3699,6 +4414,18 @@ def check_auth_log(max_lines=5000):
         output.append('失败登录统计\n' + format_ip_counts(failed_counts, '失败登录来源'))
     if accepted_counts:
         output.append('成功登录统计\n' + format_ip_counts(accepted_counts, '成功登录来源'))
+    correlated = brute_force_success_ips(failed_counts, accepted_counts)
+    if correlated:
+        output.append('疑似暴力破解后成功登录')
+        output.extend(
+            f'\tip: {ip}\tfailed: {failures}\taccepted: {accepted}'
+            f'\t[!] 同一来源大量失败后成功登录，需重点复核'
+            for ip, failures, accepted in correlated
+        )
+    invalid_users = invalid_user_counts(failed)
+    if invalid_users:
+        output.append('无效用户名统计')
+        output.extend(f'\tuser: {user}\tcount: {count}\t[i] 无效用户尝试' for user, count in invalid_users)
     for line in failed[:20] + accepted[:20]:
         output.append(f'event: {line}')
     return append_warnings('\n'.join(output) or empty_result('未发现认证异常事件'), warnings)
@@ -4019,7 +4746,10 @@ def list_services():
         return SESSION_ERROR
     result = first_success(ssh_session.client, [
         'systemctl list-units --type=service --all --no-pager 2>/dev/null',
-        'service --status-all 2>/dev/null',
+        'command -v rc-status >/dev/null 2>&1 && rc-status -a 2>/dev/null',
+        'command -v rc-update >/dev/null 2>&1 && rc-update show 2>/dev/null',
+        'command -v chkconfig >/dev/null 2>&1 && chkconfig --list 2>/dev/null',
+        'command -v service >/dev/null 2>&1 && service --status-all 2>&1',
     ], timeout=20, max_bytes=200000)
     if not result['status']:
         return command_failure(result, '服务列表获取失败')
@@ -4035,8 +4765,13 @@ def check_enabled_services():
     """
     if not check_session():
         return SESSION_ERROR
-    result = exec_command(ssh_session.client, 'systemctl list-unit-files --type=service --state=enabled --no-pager 2>/dev/null', timeout=20, max_bytes=200000)
-    if not result['status']:
+    result = first_success(ssh_session.client, [
+        'systemctl list-unit-files --type=service --state=enabled --no-pager 2>/dev/null',
+        'command -v rc-update >/dev/null 2>&1 && rc-update show 2>/dev/null',
+        'command -v chkconfig >/dev/null 2>&1 && chkconfig --list 2>/dev/null '
+        '| grep -E "[[:space:]]3:on|[[:space:]]on$"',
+    ], timeout=20, max_bytes=200000)
+    if not result['status'] and not result.get('result'):
         return command_failure(result, '开机自启服务获取失败')
     return result['result'] or empty_result('未发现 enabled 服务')
 

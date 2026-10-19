@@ -63,9 +63,10 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `check_bin`：检查 `/usr/bin` 近期修改、权限和属主异常。
 - `check_tmp`：扫描 `/tmp`、`/var/tmp`、`/dev/shm`、`/run/shm` 中的文件，并标注可执行文件和隐藏文件。
 - `check_recent_files`：检查指定目录近期变更文件。
-- `check_package_integrity`：使用 `rpm -Va` 或 `dpkg --verify` 校验已安装软件包文件完整性，用于发现被替换的系统命令、库和缺失文件；需要 root，`rpm` 全量校验可能较慢。
+- `check_package_integrity`：使用 `rpm -Va`、`dpkg --verify` 或 `apk audit --system` 校验已安装软件包文件完整性，用于发现被替换的系统命令、库和缺失文件；需要 root，`rpm` 全量校验可能较慢。
 - `discover_webroots`：自动发现常见 Web 根目录和配置中的站点目录。
-- `check_webshell`：扫描 webroot 中的疑似 WebShell。当前内置 HeMa 扫描器为 Windows `hm.exe`；若 `extensions/HeMa/hm` 存在也会自动使用。扫描完成后会删除本地解压目录，避免反复扫描占满磁盘；崩溃残留目录可通过 `AUTOIR_WEBSHELL_RETENTION_DAYS` 配置自动清理（默认 `0`，保守保留证据）。
+- `check_web_persistence`：检查站点目录与 PHP 配置中的 `.user.ini`、`.htaccess`、`php.ini`，标记 `auto_prepend_file`/`auto_append_file`、`allow_url_include`、非标准扩展路径和 PHP handler 持久化。
+- `check_webshell`：扫描 webroot 中的疑似 WebShell。扫描前会先在目标主机执行高信号代码特征与可疑文件名的启发式检查，再打包下载并调用本地 HeMa 扫描器；`hm`/`hm.exe` 按当前平台优先选择，扫描器缺失或失败时仍返回启发式结果并明确标注。扫描完成后会删除本地解压目录，避免反复扫描占满磁盘；崩溃残留目录可通过 `AUTOIR_WEBSHELL_RETENTION_DAYS` 配置自动清理（默认 `0`，保守保留证据）。
 
 ### 用户与权限
 
@@ -109,6 +110,8 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `check_inetd`
 - `check_xinetd`
 - `check_setuid`
+- `check_pam`
+- `check_sshd_config`
 - `check_startup`
 - `check_profile`
 - `check_rc`
@@ -128,6 +131,8 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `check_web_logs_auto`
 - `check_login_success`
 - `check_login_fail`
+- `check_login_sessions`
+- `check_kernel_modules`
 - `RootkitUpload`（旧名 `RookitUpload` 仍保留为兼容别名）
 
 ## SafeLine 配置
@@ -149,10 +154,14 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - SSH 命令统一返回状态、stdout/stderr、退出码、超时和截断标记；并发执行有上限，避免压垮目标 sshd。
 - 常见检测提供 fallback，例如 `ss → netstat`、`ip → hostname -I`、`last/lastb → auth.log/secure`、`find -printf → stat`；认证日志支持 `journalctl` 回退。`find` 不可用、权限不足和路径不存在会明确标注，不再表现为“无异常”。
 - 临时目录排查覆盖 `/tmp`、`/var/tmp`、`/dev/shm`、`/run/shm`，避免只查磁盘目录而漏掉内存盘驻留样本。
-- `check_package_integrity` 使用 `rpm -Va` 或 `dpkg --verify` 校验软件包文件完整性；系统可执行文件/库不一致、软件包文件缺失会重点标注，无包管理器或校验失败时明确标注需人工复核。
+- `check_package_integrity` 使用 `rpm -Va`、`dpkg --verify` 或 `apk audit --system` 校验软件包文件完整性；系统可执行文件/库不一致、软件包文件缺失会重点标注，无包管理器或校验失败时明确标注需人工复核。
 - `check_history` 除检查历史文件外，还会扫描下载执行、反弹 shell、编码解码、持久化、历史清理等特征；账户/服务类低信号命中单独标注，避免与高危特征混淆。
-- SSH 排查同时覆盖 `authorized_keys`、`authorized_keys2`、`sshrc`、`~/.ssh/rc` 和 `~/.ssh/config` 中的命令触发配置。
-- SUID/SGID 检查覆盖 `df` 列出的所有本地挂载点，同时检查 SUID 与 SGID；常见系统程序标记为“需校验包完整性”，非典型路径和属主非 root 标记为“需人工复核”，避免把 `passwd`、`sudo` 等全部误报为后门。
+- SSH 排查同时覆盖 `authorized_keys`、`authorized_keys2`、`sshrc`、`~/.ssh/rc` 和 `~/.ssh/config` 中的命令触发配置；`check_pam` 和 `check_sshd_config` 进一步覆盖 PAM 外部命令模块、`nullok`、非标准 include、`AuthorizedKeysCommand`、`ForceCommand` 和异常 HostKey/SFTP 路径。
+- `check_auth_log` 会把同一 IP 的大量失败与成功登录关联，标记“疑似暴力破解后成功登录”，并汇总无效用户名；`check_login_sessions` 关联 `who`、`last`、sshd 进程父子关系和已建立 SSH 连接，`notty` 与父进程为 1 的 sshd 会话会被标注复核。
+- `check_kernel_modules` 解析内核 taint 位（强制加载/卸载、oops、树外、未签名模块），并核对 `lsmod` 模块文件是否位于标准模块目录；已知 rootkit 模块名会重点标注。
+- `check_log` 会聚合路径穿越、SQL 注入、命令注入、PHP 伪协议、WebShell/上传脚本访问和扫描器 User-Agent，按来源 IP 与特征统计成功请求数，避免逐行刷屏。
+- SUID/SGID 检查覆盖 `df` 列出的所有本地挂载点（包括 `/dev/shm`、`/run/shm` 等 tmpfs），同时检查 SUID 与 SGID；常见系统程序标记为“需校验包完整性”，非典型路径和属主非 root 标记为“需人工复核”，避免把 `passwd`、`sudo` 等全部误报为后门。
+- 服务枚举在 systemd 之外回退到 OpenRC `rc-status`/`rc-update`、`chkconfig` 和 `service --status-all`；网络连接缺少进程信息时会明确提示非 root 或 hidepid 限制。
 - SafeLine 不可用时自动降级到本地规则，工具输出和报告必须明确标注“未经 WAF 检测”。
 - 多文件检查采用批量读取，减少 SSH 往返；每个文件保留独立退出码，权限不足不会被误报为“未发现异常”。
 - 大日志默认只分析最近 `max_lines` 行。
