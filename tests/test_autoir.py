@@ -424,6 +424,19 @@ class PermissionPropagationTests(unittest.TestCase):
         self.assertNotIn('[PERMISSION]', output)
         self.assertNotIn('[FAILED]', output)
 
+    def test_auth_log_partial_read_keeps_events_and_warns(self):
+        channel = FakeChannel(
+            [b'Failed password for root from 203.0.113.5 port 22 ssh2'],
+            [b"tail: cannot open '/var/log/secure' for reading: No such file or directory"],
+            exit_status=1,
+        )
+        server.ssh_session.client = FakeClient(channel)
+
+        output = server.check_auth_log()
+
+        self.assertIn('203.0.113.5', output)
+        self.assertIn('[WARN]', output)
+
     def test_missing_batch_entries_are_not_silently_dropped(self):
         output = (
             b'@@AUTOIR_FILE:run-1:/etc/a\n'

@@ -2713,7 +2713,7 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
 
     output = [f'仅分析最近 {max_lines} 行日志']
 
-    result = exec_command(ssh_session.client, f'tail -n {int(max_lines)} {quote_remote_path(path)} 2>/dev/null', timeout=20)
+    result = exec_command(ssh_session.client, f'tail -n {int(max_lines)} {quote_remote_path(path)}', timeout=20)
     if not result['status']:
         return command_failure(result, '日志读取失败')
     if not result['result']:
@@ -2777,7 +2777,8 @@ def check_login_success():
 
     result = first_success(ssh_session.client, [
         'last',
-        "grep -h 'Accepted' /var/log/auth.log /var/log/secure 2>/dev/null",
+        # grep exits 1 when there are simply no matches; only exit >=2 is an error.
+        "grep -h 'Accepted' /var/log/auth.log /var/log/secure; [ $? -le 1 ]",
     ])
 
     if not result['status']:
@@ -2802,7 +2803,7 @@ def check_login_fail():
 
     result = first_success(ssh_session.client, [
         'lastb',
-        "grep -h -E 'Failed password|authentication failure|Invalid user' /var/log/auth.log /var/log/secure 2>/dev/null",
+        "grep -h -E 'Failed password|authentication failure|Invalid user' /var/log/auth.log /var/log/secure; [ $? -le 1 ]",
     ])
 
     if not result['status']:
@@ -3043,11 +3044,17 @@ def check_auth_log(max_lines=5000):
         max_lines = max(1, min(int(max_lines), 50000))
     except (TypeError, ValueError):
         max_lines = 5000
-    command = f"tail -n {max_lines} /var/log/auth.log /var/log/secure 2>/dev/null"
+    command = f"tail -n {max_lines} /var/log/auth.log /var/log/secure"
     result = exec_command(ssh_session.client, command, timeout=20, max_bytes=200000)
+    warnings = []
     if not result['status']:
-        return command_failure(result, 'auth 日志读取失败')
-    lines = result['result'].splitlines()
+        # tail exits non-zero when one of the two paths is missing even though
+        # it still prints useful lines from the other one.
+        if not result.get('stdout'):
+            return command_failure(result, 'auth 日志读取失败')
+        detail = (result.get('stderr') or '').strip().splitlines()
+        warnings.append(f'[WARN] auth 日志部分读取失败: {detail[0][:200] if detail else "未知错误"}')
+    lines = (result.get('stdout') or '').splitlines()
     failed = [line for line in lines if re.search(r'Failed password|authentication failure|Invalid user', line, re.I)]
     accepted = [line for line in lines if re.search(r'Accepted (password|publickey)', line, re.I)]
     output = []
@@ -3059,7 +3066,7 @@ def check_auth_log(max_lines=5000):
         output.append('成功登录统计\n' + format_ip_counts(accepted_counts, '成功登录来源'))
     for line in failed[:20] + accepted[:20]:
         output.append(f'event: {line}')
-    return '\n'.join(output) or empty_result('未发现认证异常事件')
+    return append_warnings('\n'.join(output) or empty_result('未发现认证异常事件'), warnings)
 
 
 @mcp.tool()
