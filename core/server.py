@@ -18,6 +18,7 @@ from .functions import (
     normalize_tool_result,
     get_file_list,
     get_run_id,
+    get_safeline_server,
     is_safe_path,
     is_safe_tar_member,
     sftp_download,
@@ -29,6 +30,8 @@ from .session import SSHSession
 import paramiko
 import csv
 import json
+import os
+import shutil
 import tarfile
 import hashlib
 import subprocess
@@ -97,13 +100,14 @@ def check_session(probe=False):
 
 
 @mcp.tool()
-def get_ssh_client(ip, port=22, username='root', password='', verify_host_key=False, known_hosts=''):
+def get_ssh_client(ip, port=22, username='root', password='', verify_host_key=False, known_hosts='', key_file='', passphrase=''):
     """
     建立 SSH 会话并缓存连接，是用户提供 IP、端口、账号密码、靶机信息或应急响应题目时必须优先调用的入口工具。
     调用：看到目标 IP/账号密码/CTF 题目/应急排查任务时，不得直接根据题面回答，必须先调用本工具连接目标；所有远程检测工具前也必须先调用。
     后续：连接成功后，按用户目标调用专用 check_* / discover_* / profile_* 工具采证；交付结论、结束调查或用户要求总结前必须调用 generate_report 汇总证据。
     输出：返回连接状态和失败原因；连接失败必须在最终报告中标注检测失败或需人工复核。
     verify_host_key=True 时启用 known_hosts 主机密钥校验；known_hosts 可指定自定义文件。
+    key_file/passphrase 用于私钥登录；未指定时 paramiko 会尝试本机默认密钥和 SSH agent。
     """
 
     global ssh_session
@@ -124,6 +128,10 @@ def get_ssh_client(ip, port=22, username='root', password='', verify_host_key=Fa
         password = ''
     if not isinstance(password, str):
         return {"status": False, "result": "password 必须为字符串"}
+    if passphrase is None:
+        passphrase = ''
+    if key_file and not os.path.isfile(str(key_file)):
+        return {"status": False, "result": f"私钥文件不存在或不可读: {key_file}"}
 
     ip = ip.strip()
     username = username.strip()
@@ -138,7 +146,11 @@ def get_ssh_client(ip, port=22, username='root', password='', verify_host_key=Fa
             client.set_missing_host_key_policy(paramiko.RejectPolicy())
         else:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(ip, port=port, username=username, password=password, timeout=30)
+        connect_kwargs = {'port': port, 'username': username, 'password': password, 'timeout': 30}
+        if key_file:
+            connect_kwargs['key_filename'] = str(key_file)
+            connect_kwargs['passphrase'] = passphrase
+        client.connect(ip, **connect_kwargs)
         transport = client.get_transport()
         if transport is not None:
             transport.set_keepalive(30)
@@ -146,14 +158,17 @@ def get_ssh_client(ip, port=22, username='root', password='', verify_host_key=Fa
             old_client = ssh_session.client if ssh_session and ssh_session.client else None
             ssh_session = SSHSession(client)
         _close_client(old_client)
-        return {"status": True, "result": "SSH 连接成功"}
+        result_text = "SSH 连接成功"
+        if not verify_host_key:
+            result_text += "；警告：未校验主机密钥，存在中间人风险，实战环境建议 verify_host_key=True"
+        return {"status": True, "result": result_text}
 
     except paramiko.BadHostKeyException:
         _close_client(client)
         return {"status": False, "result": "SSH 主机密钥校验失败：目标主机密钥与 known_hosts 不匹配"}
     except paramiko.AuthenticationException:
         _close_client(client)
-        return {"status": False, "result": "SSH 认证失败：用户名或密码错误"}
+        return {"status": False, "result": "SSH 认证失败：请检查用户名、密码，或私钥/key_file、SSH agent 配置"}
     except paramiko.SSHException as e:
         _close_client(client)
         return {"status": False, "result": f"SSH 连接错误: {str(e)}"}
@@ -257,10 +272,12 @@ def check_safeline():
         ssh_session.safeline_available = result['status'] in ('hit', 'clean')
         ssh_session.safeline_checked_at = time.monotonic()
         ssh_session.safeline_error = result.get('error', '')
+    insecure_http = str(get_safeline_server() or '').lower().startswith('http://')
+    transport_note = '；警告：当前使用明文 HTTP，发送的命令/文件片段可能在传输中泄露，建议尽快启用 HTTPS' if insecure_http else ''
     if result['status'] == 'hit':
-        return {"status": True, "result": "雷池 WAF 服务存活并检出测试命令"}
+        return {"status": True, "result": f"雷池 WAF 服务存活并检出测试命令{transport_note}"}
     if result['status'] == 'clean':
-        return {"status": True, "result": "雷池 WAF 服务可达，但未拦截测试命令"}
+        return {"status": True, "result": f"雷池 WAF 服务可达，但未拦截测试命令{transport_note}"}
     if result['status'] == 'unavailable':
         return {"status": False, "result": f"雷池 WAF 不可用: {result.get('error') or '未知错误'}"}
     return {"status": False, "result": "雷池 WAF 未配置或配置无效"}
@@ -1115,31 +1132,60 @@ def count_ips_from_lines(lines):
     return counts
 
 
-def format_ip_counts(counts, label):
+def format_ip_counts(counts, label, limit=50):
     if not counts:
         return ''
-    return '\n'.join(f'ip: {ip}\tcount: {count}\t[!] {label}' for ip, count in counts.items())
+    ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    lines = [f'ip: {ip}\tcount: {count}\t[!] {label}' for ip, count in ordered[:limit]]
+    if len(ordered) > limit:
+        lines.append(f'[TRUNCATED] 共 {len(ordered)} 个来源 IP，仅展示前 {limit} 个')
+    return '\n'.join(lines)
+
+
+HIJACK_VARIABLES = (
+    'LD_PRELOAD', 'LD_AOUT_PRELOAD', 'LD_ELF_PRELOAD', 'LD_LIBRARY_PATH',
+    'PROMPT_COMMAND', 'BASH_ENV', 'ENV', 'PS4',
+)
 
 
 def check_export(filename, data):
-    try:
-        export_list = re.findall(r'export (.*)=(.*)', data)
-        for key, value in export_list:
-            if key in ('PATH', 'LD_PRELOAD', 'LD_AOUT_PRELOAD', 'LD_ELF_PRELOAD', 'LD_LIBRARY_PATH',
-                       'PROMPT_COMMAND') and value != '"$PATH:${snap_bin_path}"':
-                ssh_session.hijack_output.append(f'filename: {filename}\texport {key}={value}\t[!] 环境变量劫持')
-    except (TypeError, ValueError):
-        pass
+    seen = set()
+    for raw_line in (data or '').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        match = re.match(r'(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)', line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        finding = None
+        if key == 'PATH':
+            # Normal PATH assignments are common; only writable/relative
+            # entries are worth escalating during incident response.
+            parts = value.strip('"\'').split(':')
+            if any(part in ('', '.') or part in ('/tmp', '/var/tmp', '/dev/shm') or part.startswith(('/tmp/', '/var/tmp/', '/dev/shm/')) for part in parts):
+                finding = f'[!] PATH 包含可疑目录: {value[:200]}'
+        elif key in HIJACK_VARIABLES:
+            finding = f'[!] 环境变量劫持: {key}={value[:200]}'
+        if finding and finding not in seen:
+            seen.add(finding)
+            ssh_session.hijack_output.append(f'filename: {filename}\t{finding}')
 
 
-def process_files(file_list, base_path=''):
-    for file in file_list:
+def process_files(file_list, base_path='', warnings=None):
+    for file in dict.fromkeys(file_list):
         path = f'{base_path}{file}' if base_path else file
         command = command_format(ssh_session.hijack, f'cat {quote_remote_path(path)}')
         result = exec_command(ssh_session.client, command)
 
         if result['status'] and result['result']:
             check_export(path, result['result'])
+        elif warnings is not None:
+            kind = classify_remote_result(result)
+            if kind not in ('ok', 'not_found'):
+                issue = remote_result_issue(result, path, '读取')
+                if issue:
+                    warnings.append(issue)
 
 
 @mcp.tool()
@@ -1155,10 +1201,14 @@ def check_hijack():
 
     ssh_session.hijack = False
     ssh_session.hijack_output = []
+    warnings = []
 
-    common_files = ['/root/.bashrc', '/root/.tcshrc', '/root/.bash_profile', '/root/.cshrc', '/etc/bashrc',
-                    '/etc/profile', '/etc/csh.login', '/etc/csh.cshrc']
-    home_files = ['.bashrc', '.bash_profile', '.tcshrc', '.cshrc']
+    common_files = [
+        '/root/.bashrc', '/root/.tcshrc', '/root/.bash_profile', '/root/.cshrc',
+        '/etc/bashrc', '/etc/bash.bashrc', '/etc/profile', '/etc/environment',
+        '/etc/csh.login', '/etc/csh.cshrc', '/etc/zshrc', '/etc/zsh/zshrc', '/etc/zsh/zshenv',
+    ]
+    home_files = ['.bashrc', '.bash_profile', '.tcshrc', '.cshrc', '.profile', '.zshrc', '.zshenv', '.pam_environment']
 
     result = exec_command(ssh_session.client, 'ls -al .')
     if result['status'] and result['result'][:5] != 'total':
@@ -1166,22 +1216,22 @@ def check_hijack():
         if result['status'] and result['result'][:5] == 'total':
             ssh_session.hijack = True
 
-    process_files(common_files)
+    process_files(common_files, warnings=warnings)
 
     profile_d_files = []
     profile_d_command = command_format(ssh_session.hijack, 'ls -al /etc/profile.d/')
     profile_d_result = exec_command(ssh_session.client, profile_d_command)
     if profile_d_result['status'] and profile_d_result['result']:
         profile_d_files = [file['filename'] for file in get_file_list(profile_d_result['result']).values()]
-    process_files(profile_d_files, '/etc/profile.d/')
+    process_files(profile_d_files, '/etc/profile.d/', warnings=warnings)
 
     home_dir_command = command_format(ssh_session.hijack, 'ls -al /home')
     home_dir_result = exec_command(ssh_session.client, home_dir_command)
     if home_dir_result['status'] and home_dir_result['result']:
         ssh_session.user_list = [file['filename'] for file in get_file_list(home_dir_result['result']).values()]
-        process_files([f'/home/{user}/{f}' for user in ssh_session.user_list for f in home_files])
+        process_files([f'/home/{user}/{f}' for user in ssh_session.user_list for f in home_files], warnings=warnings)
 
-    return '\n'.join(ssh_session.hijack_output) or empty_result()
+    return append_warnings('\n'.join(ssh_session.hijack_output) or empty_result(), warnings)
 
 
 def extract_users_from_output(output):
@@ -1232,12 +1282,42 @@ def check_home():
     return append_warnings('\n'.join(users) or empty_result('未发现 /home 用户目录'), warnings)
 
 
+HISTORY_SUSPICIOUS_PATTERNS = (
+    (re.compile(r'(?:curl|wget)[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b', re.I), '下载内容直接交给 shell 执行'),
+    (re.compile(r'\b(?:nc|ncat)\b[^\n]*(?:\s-e\s|--exec\b)|/dev/tcp/', re.I), '可能的反弹 shell'),
+    (re.compile(r'\b(?:bash|sh)\s+-i\b', re.I), '交互式 shell'),
+    (re.compile(r'\bsocat\b[^\n]*\bexec:', re.I), '可能的反弹 shell'),
+    (re.compile(r'\bbase64\b[^\n]*(?:-d|--decode)|(?:xxd|openssl)\b[^\n]*(?:\s-r\b|base64)', re.I), '编码载荷解码'),
+    (re.compile(r'\b(?:useradd|adduser)\b|\bpasswd\s+root\b', re.I), '账户变更'),
+    (re.compile(r'authorized_keys', re.I), 'SSH 免密配置变更'),
+    (re.compile(r'\b(?:chmod|chown)\b[^\n]*(?:/etc/|/bin/|/usr/bin/|/tmp/|/dev/shm/)', re.I), '敏感路径权限变更'),
+    (re.compile(r'\bchmod\b[^\n]*(?:\+s\b|[24][0-7]{3}\b)', re.I), 'SUID/SGID 权限变更'),
+    (re.compile(r'\bcrontab\b|\bat\s+\d|\bsystemctl\s+enable\b', re.I), '持久化配置'),
+    (re.compile(r'\bhistory\s+-c\b|\brm\b[^\n]*\.bash_history|\bln\s+-sf\s+/dev/null[^\n]*history', re.I), '历史记录清理'),
+    (re.compile(r'\b(?:iptables|nft)\b[^\n]*\s-[DFX]\b', re.I), '防火墙规则删除'),
+    (re.compile(r'\b(?:insmod|modprobe)\b', re.I), '内核模块加载'),
+    (re.compile(r'\b(?:setcap|capsh)\b', re.I), 'Linux capability 变更'),
+)
+
+
+LOW_SIGNAL_HISTORY_REASONS = {
+    '账户变更', '持久化配置', 'Linux capability 变更', '内核模块加载', 'SSH 免密配置变更',
+}
+
+
+def history_suspicious_reason(line):
+    for pattern, reason in HISTORY_SUSPICIOUS_PATTERNS:
+        if pattern.search(line):
+            return reason
+    return None
+
+
 @mcp.tool()
 def check_history():
     """
-    检查 root 与普通用户的 bash_history 是否存在。
+    检查 root 与普通用户的 bash_history 是否存在，并扫描高危命令特征。
     调用：发现可疑用户或需追踪操作痕迹时使用。
-    输出：返回存在历史记录的路径。
+    输出：返回历史文件路径、行数和命中特征；历史记录可被清空或篡改，需结合其他证据复核。
     """
 
     if not check_session():
@@ -1250,10 +1330,21 @@ def check_history():
     for entry in read_remote_files(paths, warnings=warnings):
         if entry['status'] != 'ok':
             continue
-        if entry['content'].strip():
-            output.append(f'[!] 存在 bash_history: {entry["path"]}')
-        else:
+        lines = [line.strip() for line in entry['content'].splitlines() if line.strip()]
+        if not lines:
             output.append(f'[i] bash_history 为空: {entry["path"]}')
+            continue
+        output.append(f'[!] 存在 bash_history: {entry["path"]}\t行数: {len(lines)}')
+        hits = []
+        for line in lines[-500:]:
+            reason = history_suspicious_reason(line)
+            if reason:
+                hits.append((line, reason))
+        for line, reason in hits[:10]:
+            tag = '[i]' if reason in LOW_SIGNAL_HISTORY_REASONS else '[!]'
+            output.append(f'  {line[:200]}\t{tag} {reason}，需结合上下文复核')
+        if len(hits) > 10:
+            output.append(f'  [TRUNCATED] 另有 {len(hits) - 10} 条特征命中未展示')
 
     return append_warnings('\n'.join(output) or empty_result(), warnings)
 
@@ -1302,9 +1393,9 @@ def check_passwd():
 @mcp.tool()
 def check_ssh_keys():
     """
-    检查 root 与普通用户的 authorized_keys。
-    调用：排查 SSH 免密后门或未知公钥时使用；必要时先调用 check_home。
-    输出：返回密钥文件路径和提取到的 key 注释用户。
+    检查 root 与普通用户的 authorized_keys，以及 SSH 登录命令触发配置。
+    调用：排查 SSH 免密后门、sshrc/rc 命令执行或 ProxyCommand 持久化时使用；必要时先调用 check_home。
+    输出：返回密钥文件路径、key 注释用户，以及 sshrc/rc/config 中的可疑命令。
     """
 
     if not check_session():
@@ -1322,7 +1413,36 @@ def check_ssh_keys():
         if entry['status'] != 'ok':
             continue
         key_users = ', '.join(extract_users_from_output(entry['content'])) or '无注释'
-        output.append(f'{entry["path"]}\tuser list: {key_users}\t[!] 存在 SSH authorized_keys')
+        restricted = any(token in entry['content'] for token in ('command=', 'environment=', 'permitopen='))
+        tag = '[i] authorized_keys 含强制命令/环境限制，需重点核对' if restricted else '[i] 存在 authorized_keys，需核对公钥来源'
+        output.append(f'{entry["path"]}\tuser list: {key_users}\t{tag}')
+
+    # ~/.ssh/rc and /etc/ssh/sshrc execute on login; ProxyCommand/LocalCommand
+    # in ~/.ssh/config can provide command execution or tunnelling persistence.
+    trigger_paths = ['/etc/ssh/sshrc']
+    for directory in dirs:
+        trigger_paths.extend([f'{directory}/rc', f'{directory}/config'])
+    for entry in read_remote_files(trigger_paths, warnings=warnings):
+        if entry['status'] != 'ok':
+            continue
+        hits = []
+        is_config = Path(entry['path']).name == 'config'
+        for raw_line in entry['content'].splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#'):
+                continue
+            lower = line.lower()
+            if is_config:
+                if any(token in lower for token in ('proxycommand', 'localcommand', 'match exec', 'permitlocalcommand')):
+                    hits.append(line)
+            else:
+                hits.append(line)
+        if hits:
+            output.append(f'{entry["path"]}\t[!] SSH 登录命令触发配置，需重点复核')
+            for line in hits[:5]:
+                output.append(f'  {line[:200]}')
+            if len(hits) > 5:
+                output.append(f'  [TRUNCATED] 另有 {len(hits) - 5} 行未展示')
 
     # List other files so private keys, config edits and dropped files are
     # visible without mislabelling every file as authorized_keys.
@@ -1410,15 +1530,20 @@ def check_sudoers():
                 parts = line.split()
                 if len(parts) > 0:
                     user_or_group = parts[0]
+                    tag = (
+                        '[!] sudo 免密授权（NOPASSWD），需重点核对'
+                        if 'NOPASSWD' in line
+                        else '[i] sudo 授权，需核对是否符合预期'
+                    )
 
                     if user_or_group.startswith('%'):
                         group_name = user_or_group[1:]
                         users_in_group = ssh_session.group_list.get(group_name, [])
                         tmp = f'group: {group_name}\tuser: {", ".join(users_in_group)}'
-                        output.append(f'{tmp}\t[!] sudo 权限组异常')
+                        output.append(f'{tmp}\t{tag}')
                     else:
                         tmp = f'{"user: " + user_or_group}'
-                        output.append(f'{tmp}\t[!] sudo 权限组异常')
+                        output.append(f'{tmp}\t{tag}')
 
     return append_warnings('\n'.join(output) or empty_result(), warnings)
 
@@ -1481,14 +1606,54 @@ def parse_ps_output(output):
     return processes
 
 
+def parse_ps_ef_output(output):
+    """Parse the portable `ps -ef` layout used when BSD-style ps is missing.
+
+    CPU/MEM are unavailable in this format; they are set to 0 so resource
+    checks do not invent values. The process list is still useful for
+    hidden-PID and process-mismatch comparisons.
+    """
+    processes = {}
+    for line in output.splitlines()[1:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 8:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        command = ' '.join(parts[7:])
+        exe = command.split()[0] if command.strip() else ''
+        if exe.startswith('[') and exe.endswith(']'):
+            exe = exe[1:-1]
+        elif '/' in exe:
+            exe = Path(exe).name
+        processes[pid] = {
+            'user': parts[0],
+            'cpu': 0.0,
+            'mem': 0.0,
+            'tty': parts[5],
+            'time': parts[6],
+            'command': command,
+            'exe': exe,
+        }
+    return processes
+
+
 PROCESS_SNAPSHOT_TTL = 60
 
 
 def load_processes():
-    result = exec_command(ssh_session.client, 'ps -aux')
     processes = {}
-    if result['status'] and result['result']:
+    for command in ('ps -aux', 'ps auxww', 'ps -ef'):
+        result = exec_command(ssh_session.client, command)
+        if not result['status'] or not result['result']:
+            continue
         processes = parse_ps_output(result['result'])
+        if not processes:
+            processes = parse_ps_ef_output(result['result'])
+        if processes:
+            break
     with state_lock:
         ssh_session.ps = processes
         ssh_session.ps_time = time.monotonic() if processes else 0.0
@@ -1542,7 +1707,10 @@ def check_mine():
     for pid, proc in processes.items():
         cpu, mem, command = proc['cpu'], proc['mem'], proc['command']
         if cpu > 50.0 or mem > 50.0:
-            output += f'PID: {pid}\tCPU: {cpu}\tMEM: {mem}\tCOMMAND: {command}\t[!] "疑似挖矿脚本，cpu/mem 占用超过 50%", "red"\n'
+            output += (
+                f'PID: {pid}\tCPU: {cpu}\tMEM: {mem}\tCOMMAND: {command}'
+                '\t[!] CPU/内存占用超过 50%，需结合命令行、父进程和启动时间复核\n'
+            )
     return output or empty_result()
 
 
@@ -1649,26 +1817,36 @@ def check_exe():
     with state_lock:
         processes = dict(ssh_session.ps)
 
-    result = exec_command(ssh_session.client, 'ls -al /proc/*/exe 2>/dev/null')
+    result = exec_command(ssh_session.client, 'ls -al /proc/*/exe 2>&1')
     if not result['status'] and not result['result']:
         return command_failure(result, '/proc exe 读取失败')
-    if result['status'] and result['result']:
-        try:
-            group = re.findall(r'.*/proc/(\d+)/exe -> (.*)', result['result'])
-            for item in group:
-                pid = item[0]
-                true_exe = Path(item[1]).name  # exe 真实指向命令
-                if int(pid) in processes:
-                    exe = processes[int(pid)]['exe']
+    warnings = []
+    text = result['result'] or ''
+    if 'Permission denied' in text or '权限' in text:
+        warnings.append('[PERMISSION] 部分 /proc/<pid>/exe 不可读，比对结果可能不完整，需人工复核')
+    matched = 0
+    try:
+        group = re.findall(r'.*/proc/(\d+)/exe -> (.*)', text)
+        matched = len(group)
+        for item in group:
+            pid = item[0]
+            true_exe = Path(item[1]).name  # exe 真实指向命令
+            if int(pid) in processes:
+                exe = processes[int(pid)]['exe']
 
-                    if true_exe != exe:
-                        output += f'PID: {pid}\ttrue_exe: {true_exe}\texe: {exe}\t[!] 进程名与真实可执行文件不一致，需结合上下文复核\n'
-        except ValueError:
-            pass
+                if true_exe != exe:
+                    output += f'PID: {pid}\ttrue_exe: {true_exe}\texe: {exe}\t[!] 进程名与真实可执行文件不一致，需结合上下文复核\n'
+    except ValueError:
+        pass
 
     if not output and not processes:
         return command_failure({'error': '进程快照为空，无法比对可执行文件'}, '/proc exe 比对失败')
-    return output or empty_result()
+    if not output and not matched:
+        return append_warnings(
+            '[FAILED] 未解析到任何 /proc/<pid>/exe 记录，无法完成比对，需人工复核',
+            warnings,
+        )
+    return append_warnings(output or empty_result(), warnings)
 
 
 @mcp.tool()
@@ -1692,7 +1870,7 @@ def check_mount():
 
     try:
         for pid in re.findall(r'/proc/(\d+)', result['result']):
-            output += f'path: /proc/{pid}\t[!] mount 挂载后门\n'
+            output += f'path: /proc/{pid}\t[i] /proc/<pid> 相关挂载，需人工复核\n'
     except re.error:
         pass
 
@@ -1923,92 +2101,299 @@ def check_hosts():
 
 
 @mcp.tool()
-def check_bin():
+def check_bin(path=''):
     """
-    采集 /usr/bin 关键文件线索。
-    调用：怀疑系统命令被替换、权限异常或新增可疑命令时使用。
+    采集系统命令目录关键文件线索。
+    调用：怀疑系统命令被替换、权限异常、新增可疑命令或 /usr/local 落地后门时使用。
     输出：返回近期修改、非 root 属主、异常权限和软链信息，供结合上下文复核。
+    默认扫描 /usr/bin、/usr/sbin、/usr/local/bin、/usr/local/sbin；可传 path 只扫描指定目录。
     """
 
     if not check_session():
         return SESSION_ERROR
 
-    result = exec_command(ssh_session.client, 'ls -alt /usr/bin')
-    if not result['status']:
-        return command_failure(result, '/usr/bin 文件列表读取失败')
-    if not result['result']:
-        return empty_result()
-
-    files = list(get_file_list(result['result']).values())
-    recent_files = []
-    suspicious_files = []
-    symlink_files = []
-
-    for file in files:
-        filename = file['filename']
-        owner = file['owner']
-        group = file['group']
-        perm = file['perm']
-        time = file['time']
-        link = ''
-
-        if ' -> ' in filename:
-            filename, link = filename.split(' -> ', 1)
-
-        if len(recent_files) < 10:
-            recent_files.append(f'file: {filename}\ttime: {time}\t[i] /usr/bin 近期修改文件')
-
-        reasons = []
-        if owner != 'root' or group != 'root':
-            reasons.append('非 root 属主/属组')
-        if len(perm) > 8 and perm[8] == 'w':
-            reasons.append('other 可写权限')
-        if len(perm) > 3 and perm[3] in {'s', 'S'}:
-            reasons.append('setuid 权限')
-        if len(perm) > 6 and perm[6] in {'s', 'S'}:
-            reasons.append('setgid 权限')
-
-        if reasons:
-            suspicious_files.append(
-                f'file: {filename}\tperm: {perm}\towner: {owner}\tgroup: {group}\t[!] {", ".join(reasons)}，需结合上下文复核'
-            )
-        if link:
-            symlink_files.append(f'file: {filename}\tlink: {link}\t[i] /usr/bin 软链条目')
-
+    directories = [path] if path else ['/usr/bin', '/usr/sbin', '/usr/local/bin', '/usr/local/sbin']
+    warnings = []
     output = []
-    output.extend(recent_files)
-    output.extend(suspicious_files[:50])
-    if len(suspicious_files) > 50:
-        output.append(f'[i] 还有 {len(suspicious_files) - 50} 条权限/属主线索未展示')
-    output.extend(symlink_files[:30])
-    if len(symlink_files) > 30:
-        output.append(f'[i] 还有 {len(symlink_files) - 30} 条软链线索未展示')
 
-    return '\n'.join(output) or empty_result()
+    for directory in directories:
+        result = exec_command(ssh_session.client, f'ls -alt {quote_remote_path(directory)} 2>&1')
+        kind = classify_remote_result(result)
+        if kind == 'not_found':
+            if path:
+                return remote_result_issue(result, directory, '读取', include_missing=True) or f'{directory} 不存在'
+            continue
+        if kind != 'ok':
+            issue = remote_result_issue(result, directory, '读取')
+            if issue:
+                warnings.append(issue)
+            continue
+        if not result['result']:
+            continue
+
+        files = list(get_file_list(result['result']).values())
+        recent_files = []
+        suspicious_files = []
+        symlink_files = []
+
+        for file in files:
+            filename = file['filename']
+            owner = file['owner']
+            group = file['group']
+            perm = file['perm']
+            time = file['time']
+            link = ''
+
+            if ' -> ' in filename:
+                filename, link = filename.split(' -> ', 1)
+
+            full_path = f'{directory.rstrip("/")}/{filename}'
+            if len(recent_files) < 10:
+                recent_files.append(f'file: {full_path}\ttime: {time}\t[i] {directory} 近期修改文件')
+
+            reasons = []
+            if owner != 'root' or group != 'root':
+                reasons.append('非 root 属主/属组')
+            if len(perm) > 8 and perm[8] == 'w':
+                reasons.append('other 可写权限')
+            if len(perm) > 3 and perm[3] in {'s', 'S'}:
+                reasons.append('setuid 权限')
+            if len(perm) > 6 and perm[6] in {'s', 'S'}:
+                reasons.append('setgid 权限')
+
+            if reasons:
+                suspicious_files.append(
+                    f'file: {full_path}\tperm: {perm}\towner: {owner}\tgroup: {group}\t[!] {", ".join(reasons)}，需结合上下文复核'
+                )
+            if link:
+                symlink_files.append(f'file: {full_path}\tlink: {link}\t[i] {directory} 软链条目')
+
+        output.extend(recent_files)
+        output.extend(suspicious_files[:50])
+        if len(suspicious_files) > 50:
+            output.append(f'[i] {directory} 还有 {len(suspicious_files) - 50} 条权限/属主线索未展示')
+        output.extend(symlink_files[:30])
+        if len(symlink_files) > 30:
+            output.append(f'[i] {directory} 还有 {len(symlink_files) - 30} 条软链线索未展示')
+
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
+
+
+def package_integrity_tag(line, manager):
+    """Classify an rpm/dpkg integrity mismatch line for review priority."""
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if manager == 'rpm' and stripped.lower().startswith('missing'):
+        return '[!] 软件包文件缺失，需重点复核'
+    # rpm/dpkg verification lines begin with 9 attribute characters followed by
+    # whitespace. Skip database errors and other diagnostic text.
+    if not re.match(r'^[\w?.]{9}\s', stripped):
+        return None
+    # Binaries and shared libraries are the highest-value tampering targets.
+    if any(
+        token in stripped
+        for token in ('/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/', '/lib/', '/lib64/', '/usr/lib/', '/usr/lib64/')
+    ):
+        return '[!] 系统可执行文件/库与软件包记录不一致，需重点复核'
+    return '[i] 文件与软件包记录不一致，需人工复核'
+
+
+@mcp.tool()
+def check_package_integrity(max_lines=200):
+    """
+    校验已安装软件包的文件完整性，发现被替换或缺失的系统文件。
+    调用：怀疑系统命令被替换、二进制后门或 rootkit 时使用；需要 root 权限，rpm 全量校验可能较慢。
+    输出：返回 rpm/dpkg 校验差异，系统可执行文件和库不一致会重点标注。
+    """
+
+    if not check_session():
+        return SESSION_ERROR
+    try:
+        max_lines = max(1, min(int(max_lines), 1000))
+    except (TypeError, ValueError):
+        max_lines = 200
+
+    nonce = get_run_id()
+    mgr_mark = f'@@AUTOIR_PKG:{nonce}:MGR@@'
+    lines_mark = f'@@AUTOIR_PKG:{nonce}:LINES@@'
+    err_mark = f'@@AUTOIR_PKG:{nonce}:ERR@@'
+    rc_mark = f'@@AUTOIR_PKG:{nonce}:RC@@'
+
+    command = (
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_pkg_$$.err); '
+        'out=$(mktemp 2>/dev/null || echo /tmp/autoir_pkg_$$.out); '
+        'if command -v rpm >/dev/null 2>&1; then '
+        'mgr=rpm; rpm -Va --noscripts >"$out" 2>"$err"; rc=$?; '
+        'elif command -v dpkg >/dev/null 2>&1; then '
+        'mgr=dpkg; dpkg --verify >"$out" 2>"$err"; rc=$?; '
+        'else mgr=none; : >"$out"; printf "rpm/dpkg not found\\n" >"$err"; rc=127; fi; '
+        f'printf "{mgr_mark}%s\\n" "$mgr"; '
+        f'head -n {max_lines} "$out"; '
+        f'printf "\\n{lines_mark}\\n"; '
+        'wc -l <"$out"; '
+        f'printf "{err_mark}\\n"; '
+        'head -n 5 "$err"; '
+        f'printf "\\n{rc_mark}%s\\n" "$rc"; '
+        'rm -f "$out" "$err"'
+    )
+    result = exec_command(ssh_session.client, command, timeout=180, max_bytes=400000)
+    text = result.get('result') or ''
+    if not text:
+        return command_failure(result, '软件包完整性校验失败')
+
+    warnings = []
+    if result.get('truncated'):
+        warnings.append('[TRUNCATED] 软件包校验输出超过上限，结果可能不完整')
+
+    _, _, rest = text.partition(mgr_mark)
+    manager = rest.split('\n', 1)[0].strip() if rest else ''
+    after_manager = rest.split('\n', 1)[1] if '\n' in rest else ''
+    body, _, tail = after_manager.partition(lines_mark)
+    total_text, _, err_part = tail.partition(err_mark)
+    errors, _, rc_part = err_part.partition(rc_mark)
+    try:
+        total = int(total_text.strip().splitlines()[-1].strip())
+    except (ValueError, IndexError):
+        total = None
+    try:
+        return_code = int(rc_part.strip().splitlines()[0].strip()) if rc_part.strip() else None
+    except (ValueError, IndexError):
+        return_code = None
+
+    if manager in ('', 'none'):
+        return append_warnings('[INFO] 未检测到 rpm/dpkg，无法校验软件包完整性，需人工复核', warnings)
+
+    lines = []
+    for raw_line in body.splitlines():
+        tag = package_integrity_tag(raw_line, manager)
+        if tag:
+            lines.append(f'{raw_line.strip()}\t{tag}')
+
+    error_text = errors.strip()
+    if error_text:
+        error_kind = classify_remote_error_text(error_text)
+        if error_kind == 'permission_denied':
+            warnings.append(f'[PERMISSION] 软件包校验权限不足，结果可能不完整: {error_text.splitlines()[0][:200]}')
+        elif not lines:
+            warnings.append(f'[WARN] {manager} 校验提示: {error_text.splitlines()[0][:200]}')
+    if return_code not in (None, 0) and not lines and not error_text:
+        warnings.append(f'[WARN] {manager} 校验退出码 {return_code}，未返回差异明细')
+
+    if not lines:
+        if total:
+            return append_warnings(f'[WARN] 软件包校验共有 {total} 条差异，但未能解析明细，需人工复核', warnings)
+        return append_warnings(f'[i] {manager} 校验未发现文件差异', warnings)
+
+    header = f'manager: {manager}\t差异文件数: {total if total is not None else len(lines)}'
+    if total is not None and total > len(lines):
+        warnings.append(f'[TRUNCATED] 共 {total} 条差异，仅展示前 {len(lines)} 条')
+    return append_warnings('\n'.join([header] + lines), warnings)
 
 
 @mcp.tool()
 def check_tmp():
     """
-    列举 /tmp 下文件。
-    调用：排查临时目录落地文件、脚本或恶意样本时使用。
-    输出：返回 /tmp 可疑文件路径。
+    列举常见临时目录（/tmp、/var/tmp、/dev/shm、/run/shm）下的文件。
+    调用：排查临时目录落地文件、脚本、内存盘驻留样本或恶意文件时使用。
+    输出：返回可疑临时文件路径、属主、权限和时间。
     """
 
     if not check_session():
         return SESSION_ERROR
 
-    result = first_success(ssh_session.client, [
-        "find /tmp -type f -printf '%p\t%u:%g\t%m\t%s bytes\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | head -n 1000",
-        'find /tmp -type f 2>/dev/null | head -n 1000',
-    ], timeout=30, max_bytes=300000)
-    if not result['status']:
-        return command_failure(result, '/tmp 文件扫描失败')
-    if not result['result']:
-        return empty_result()
+    # Malware frequently runs from /dev/shm to avoid disk forensics; /var/tmp
+    # survives reboots more often than /tmp. Scan all common locations.
+    command = (
+        'dirs=""; '
+        'for d in /tmp /var/tmp /dev/shm /run/shm; do [ -d "$d" ] && dirs="$dirs $d"; done; '
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_tmp_$$.err); '
+        'out=$(mktemp 2>/dev/null || echo /tmp/autoir_tmp_$$.out); '
+        'if [ -n "$dirs" ]; then '
+        "find $dirs -xdev -type f -printf '%p\\t%u:%g\\t%m\\t%s bytes\\t%TY-%Tm-%Td %TH:%TM\\n' "
+        '>"$out" 2>"$err"; rc=$?; '
+        'if [ "$rc" -ne 0 ] && [ ! -s "$out" ]; then '
+        'find $dirs -xdev -type f >"$out" 2>>"$err"; fi; '
+        'else printf "no temp directory found\\n" >"$err"; fi; '
+        'head -n 1000 "$out"; '
+        f"printf '\\n{FIND_STDERR_MARK}\\n'; "
+        'head -n 5 "$err"; rm -f "$out" "$err"'
+    )
+    result = exec_command(ssh_session.client, command, timeout=30, max_bytes=300000)
+    if not result['status'] and not result['result']:
+        return command_failure(result, '临时目录文件扫描失败')
+    data, errors = split_find_output(result['result'])
+    warnings = []
+    if errors:
+        if find_printf_fallback_error(errors):
+            warnings.append('[INFO] 目标 find 不支持 -printf，已回退到路径列表')
+        elif classify_remote_error_text(errors) == 'permission_denied':
+            warnings.append(f'[PERMISSION] 临时目录扫描权限不足，结果可能不完整: {errors.splitlines()[0][:200]}')
+        else:
+            warnings.append(f'[WARN] 临时目录扫描部分失败: {errors.splitlines()[0][:200]}')
+    if not data:
+        return append_warnings(empty_result(), warnings)
 
-    output = ''.join(f'file path: {item.strip()}\t[!] /tmp 目录下可疑文件\n' for item in result['result'].splitlines())
-    return output or empty_result()
+    temp_dirs = ('/dev/shm', '/run/shm', '/var/tmp', '/tmp')
+    output = []
+    for item in data.splitlines():
+        line = item.strip()
+        if not line:
+            continue
+        parts = line.split('\t')
+        file_path = parts[0]
+        location = next(
+            (root for root in temp_dirs if file_path == root or file_path.startswith(root + '/')),
+            file_path,
+        )
+        tag = f'[i] {location} 文件，需复核'
+        if len(parts) >= 3 and re.fullmatch(r'[0-7]{3,4}', parts[2].strip()):
+            try:
+                if int(parts[2].strip(), 8) & 0o111:
+                    tag = f'[!] {location} 可执行文件，需优先复核'
+            except ValueError:
+                pass
+        if Path(file_path).name.startswith('.'):
+            tag = f'[!] {location} 隐藏文件，需优先复核'
+        output.append(f'file path: {file_path}\t{tag}')
+    return append_warnings('\n'.join(output) or empty_result(), warnings)
+
+
+FIND_STDERR_MARK = '@@AUTOIR_FIND_STDERR@@'
+
+
+def portable_recent_find(paths, days, printf_format, stat_format, max_results):
+    """Build a recent-file find command that never hides failures.
+
+    GNU find uses -printf; busybox or restricted find builds fall back to stat
+    when the first pass fails without output. stderr is returned after a marker
+    so permission and missing-path errors stay visible to the caller instead of
+    becoming a false "no changes" result.
+    """
+    quoted_paths = ' '.join(quote_remote_path(item) for item in paths)
+    return (
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_find_$$.err); '
+        'out=$(mktemp 2>/dev/null || echo /tmp/autoir_find_$$.out); '
+        f"find {quoted_paths} -type f -mtime -{days} -printf '{printf_format}' >\"$out\" 2>\"$err\"; rc=$?; "
+        f'if [ "$rc" -ne 0 ] && [ ! -s "$out" ]; then '
+        f"find {quoted_paths} -type f -mtime -{days} -exec stat -c '{stat_format}' {{}} + "
+        '>"$out" 2>>"$err"; fi; '
+        f'head -n {max_results} "$out"; '
+        f"printf '\\n{FIND_STDERR_MARK}\\n'; "
+        'head -n 10 "$err"; rm -f "$out" "$err"'
+    )
+
+
+def split_find_output(output):
+    data, separator, errors = str(output or '').partition(FIND_STDERR_MARK)
+    if not separator:
+        return data.strip('\n'), ''
+    return data.strip('\n'), errors.strip()
+
+
+def find_printf_fallback_error(errors):
+    lowered = (errors or '').lower()
+    return any(token in lowered for token in ('-printf', 'unrecognized option', 'invalid option'))
 
 
 @mcp.tool()
@@ -2016,7 +2401,7 @@ def check_recent_files(path='/tmp', days=7, max_results=200):
     """
     检查指定目录近期变更文件。
     调用：排查 /tmp、webroot、用户目录中近期落地的脚本、样本、隐藏 shell、免杀马或异常文件时使用。
-    输出：返回文件路径、属主、权限、大小和修改时间。
+    输出：返回文件路径、属主、权限、大小和修改时间；find 失败或权限不足会明确标注。
     """
     if not check_session():
         return SESSION_ERROR
@@ -2031,19 +2416,37 @@ def check_recent_files(path='/tmp', days=7, max_results=200):
         max_results = max(1, min(int(max_results), 1000))
     except (TypeError, ValueError):
         max_results = 200
+    path = path.strip()
 
-    quoted_path = quote_remote_path(path.strip())
-    command = (
-        f"find {quoted_path} -type f -mtime -{days} "
-        f"-printf '%TY-%Tm-%Td %TH:%TM\t%u:%g\t%m\t%s bytes\t%p\\n' 2>/dev/null "
-        f"| head -n {max_results}"
+    command = portable_recent_find(
+        [path],
+        days,
+        '%TY-%Tm-%Td %TH:%TM\\t%u:%g\\t%m\\t%s bytes\\t%p\\n',
+        '%y\\t%U:%G\\t%A\\t%s bytes\\t%n',
+        max_results,
     )
-    result = exec_command(ssh_session.client, command, timeout=30, max_bytes=300000)
-    if not result['status']:
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=300000)
+    if not result['status'] and not result['result']:
         return command_failure(result, '近期文件扫描失败')
-    if not result['result']:
-        return empty_result(f'最近 {days} 天未发现变更文件')
-    return '\n'.join(f'{line}\t[i] 近期变更文件' for line in result['result'].splitlines())
+
+    data, errors = split_find_output(result['result'])
+    warnings = []
+    if errors:
+        kind = classify_remote_error_text(errors)
+        first = errors.splitlines()[0][:200]
+        if find_printf_fallback_error(errors):
+            warnings.append('[INFO] 目标 find 不支持 -printf，已回退到 stat 输出')
+        elif kind == 'permission_denied':
+            warnings.append(f'[PERMISSION] 近期文件扫描权限不足，结果可能不完整，需人工复核: {first}')
+        elif kind == 'not_found':
+            return f'[NOT_FOUND] 路径不存在: {path}\n{first}'
+        else:
+            warnings.append(f'[WARN] find 扫描部分失败: {first}')
+
+    if not data:
+        return append_warnings(empty_result(f'最近 {days} 天未发现变更文件'), warnings)
+    output = '\n'.join(f'{line}\t[i] 近期变更文件' for line in data.splitlines())
+    return append_warnings(output, warnings)
 
 
 @mcp.tool()
@@ -2103,6 +2506,40 @@ done'''
     return '\n'.join(output)
 
 
+WEBROOT_RUN_PATTERN = re.compile(r'^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}_\d{6}_[0-9a-f]{8}$')
+
+
+def prune_stale_webshell_runs(max_age_days=None):
+    """Remove crash-leftover webroot run directories when retention is set.
+
+    Normal scans always delete their temporary extraction directory. This is
+    only a safety net for interrupted runs, disabled by default (0) because an
+    extracted webroot can be evidence. Set AUTOIR_WEBSHELL_RETENTION_DAYS to a
+    positive value to enable it.
+    """
+    if max_age_days is None:
+        try:
+            max_age_days = int(os.environ.get('AUTOIR_WEBSHELL_RETENTION_DAYS', '0'))
+        except ValueError:
+            max_age_days = 0
+    if max_age_days <= 0:
+        return
+    cutoff = time.time() - max_age_days * 86400
+    downloads = Path(base_dir) / 'downloads'
+    try:
+        entries = list(downloads.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.is_dir() or not WEBROOT_RUN_PATTERN.match(entry.name):
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
 @mcp.tool()
 def check_webshell(path='/var/www/html', max_files=20000):
     """
@@ -2113,6 +2550,8 @@ def check_webshell(path='/var/www/html', max_files=20000):
 
     if not check_session():
         return SESSION_ERROR
+
+    prune_stale_webshell_runs()
 
     output = ''
     if not isinstance(path, str) or not path.strip() or not path.strip().startswith('/'):
@@ -2196,96 +2635,115 @@ def check_webshell(path='/var/www/html', max_files=20000):
         if not download_result.get('status') or not archive_path.exists():
             return f'webroot 下载失败：{download_result.get("error") or "未生成本地压缩包"}'
 
-        extracted_bytes = 0
-        max_extract_bytes = 2 * 1024 * 1024 * 1024
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            member_count = 0
-            for member in tar:
-                member_count += 1
-                if member_count > max_files:
-                    return output + f'压缩包成员数量超过限制 {max_files}，已停止解压'
-                if not is_safe_tar_member(local_path, member):
-                    server_path = path.rstrip('/') + '/' + member.name.replace('\\', '/')
-                    output += f'file path: {server_path}\t[!] 路径/类型/大小异常已拦截\n'
-                    continue
-                extracted_bytes += max(member.size, 0)
-                if extracted_bytes > max_extract_bytes:
-                    return output + '解压后总大小超过限制 2GB，已停止解压'
-                try:
-                    tar.extract(member, local_path, filter='data')
-                except TypeError:
-                    # Python < 3.12 has no extraction filter; manual checks above
-                    # already reject links, devices, FIFOs and traversal.
-                    tar.extract(member, local_path)
-
-        scanner_path = Path(base_dir) / 'extensions' / 'HeMa' / 'hm.exe'
-        if not scanner_path.is_file():
-            return output + f'扫描器不存在: {scanner_path}'
-        result_path = Path(base_dir) / 'extensions' / 'HeMa' / 'result.csv'
-        rows = []
-        # HeMa writes a shared result.csv; serialize scans so concurrent calls
-        # cannot mix each other's findings.
-        with webshell_lock:
-            try:
-                result_path.unlink()
-            except OSError:
-                pass
-            try:
-                result = subprocess.run(
-                    [str(scanner_path), 'scan', str(local_path)],
-                    capture_output=True, text=True, encoding='utf-8', errors='ignore', timeout=300,
-                )
-            except subprocess.TimeoutExpired:
-                return output + '扫描器执行超时'
-            except OSError as error:
-                return output + f'扫描器执行失败: {error}'
-
-            count = 0
-            summary_found = False
-            for line in result.stdout.splitlines():
-                if "总计" in line:
-                    summary_found = True
+        try:
+            extracted_bytes = 0
+            max_extract_bytes = 2 * 1024 * 1024 * 1024
+            with tarfile.open(archive_path, 'r:gz') as tar:
+                member_count = 0
+                for member in tar:
+                    member_count += 1
+                    if member_count > max_files:
+                        return output + f'压缩包成员数量超过限制 {max_files}，已停止解压'
+                    if not is_safe_tar_member(local_path, member):
+                        server_path = path.rstrip('/') + '/' + member.name.replace('\\', '/')
+                        output += f'file path: {server_path}\t[!] 路径/类型/大小异常已拦截\n'
+                        continue
+                    extracted_bytes += max(member.size, 0)
+                    if extracted_bytes > max_extract_bytes:
+                        return output + '解压后总大小超过限制 2GB，已停止解压'
                     try:
-                        count = int(line.replace(' ', '').split('|')[-2])
-                    except (IndexError, ValueError):
-                        count = 0
+                        tar.extract(member, local_path, filter='data')
+                    except TypeError:
+                        # Python < 3.12 has no extraction filter; manual checks above
+                        # already reject links, devices, FIFOs and traversal.
+                        tar.extract(member, local_path)
 
-            if result.returncode != 0:
-                if not result_path.exists():
-                    detail = (result.stderr or result.stdout).strip()
-                    return output + (
-                        f'扫描器执行失败 (exit {result.returncode}): '
-                        f'{truncate_text(detail, 500) or "无输出"}'
-                    )
-                output += f'[WARN] 扫描器退出码为 {result.returncode}，已尝试解析现有 result.csv，需人工复核\n'
-            if count and not result_path.exists():
-                return output + f'扫描器报告疑似 {count} 个文件，但未生成 result.csv'
-            if not summary_found and not result_path.exists():
-                detail = (result.stderr or result.stdout).strip()
-                return output + f'扫描器输出无法解析，检测结果未知: {truncate_text(detail, 500) or "无输出"}'
-
-            # Parse any result.csv even when the summary line is missing or
-            # unparsable; missing findings are worse than extra findings.
-            if result_path.exists():
+            scanner_dir = Path(base_dir) / 'extensions' / 'HeMa'
+            scanner_path = next(
+                (candidate for candidate in (scanner_dir / 'hm.exe', scanner_dir / 'hm') if candidate.is_file()),
+                None,
+            )
+            if scanner_path is None:
+                return (
+                    output
+                    + f'扫描器不存在: {scanner_dir / "hm.exe"}'
+                    + '（当前平台无可用 HeMa 扫描器，需人工复核）'
+                )
+            result_path = scanner_dir / 'result.csv'
+            rows = []
+            # HeMa writes a shared result.csv; serialize scans so concurrent calls
+            # cannot mix each other's findings.
+            with webshell_lock:
                 try:
-                    csvfile = open(result_path, 'r', encoding='utf-8', errors='ignore')
+                    result_path.unlink()
+                except OSError:
+                    pass
+                try:
+                    result = subprocess.run(
+                        [str(scanner_path), 'scan', str(local_path)],
+                        capture_output=True, text=True, encoding='utf-8', errors='ignore', timeout=300,
+                    )
+                except subprocess.TimeoutExpired:
+                    return output + '扫描器执行超时'
                 except OSError as error:
-                    return output + f'扫描器结果读取失败: {error}'
-                with csvfile:
-                    csv_reader = csv.reader(csvfile, delimiter=',')
-                    next(csv_reader, None)  # 跳过表头
-                    rows = [row for row in csv_reader if len(row) >= 3]
+                    return output + f'扫描器执行失败: {error}'
 
-        for row in rows:
-            file_path = Path(row[2])
-            if not file_path.is_file():
-                continue
-            try:
-                md5 = file_md5(file_path)
-            except OSError:
-                md5 = '读取失败'
-            server_path = str(file_path).replace(str(local_path), path).replace('\\', '/')
-            output += f'file path: {server_path}\tmd5: {md5}\t[!] 疑似 webshell 文件\n'
+                count = 0
+                summary_found = False
+                for line in result.stdout.splitlines():
+                    if "总计" in line:
+                        summary_found = True
+                        try:
+                            count = int(line.replace(' ', '').split('|')[-2])
+                        except (IndexError, ValueError):
+                            count = 0
+
+                if result.returncode != 0:
+                    if not result_path.exists():
+                        detail = (result.stderr or result.stdout).strip()
+                        return output + (
+                            f'扫描器执行失败 (exit {result.returncode}): '
+                            f'{truncate_text(detail, 500) or "无输出"}'
+                        )
+                    output += f'[WARN] 扫描器退出码为 {result.returncode}，已尝试解析现有 result.csv，需人工复核\n'
+                if count and not result_path.exists():
+                    return output + f'扫描器报告疑似 {count} 个文件，但未生成 result.csv'
+                if not summary_found and not result_path.exists():
+                    detail = (result.stderr or result.stdout).strip()
+                    return output + f'扫描器输出无法解析，检测结果未知: {truncate_text(detail, 500) or "无输出"}'
+
+                # Parse any result.csv even when the summary line is missing or
+                # unparsable; missing findings are worse than extra findings.
+                if result_path.exists():
+                    try:
+                        csvfile = open(result_path, 'r', encoding='utf-8', errors='ignore')
+                    except OSError as error:
+                        return output + f'扫描器结果读取失败: {error}'
+                    with csvfile:
+                        csv_reader = csv.reader(csvfile, delimiter=',')
+                        next(csv_reader, None)  # 跳过表头
+                        rows = [row for row in csv_reader if len(row) >= 3]
+
+            for row in rows:
+                raw_path = Path(row[2])
+                file_path = raw_path if raw_path.is_absolute() else local_path / raw_path
+                if not file_path.is_file():
+                    output += f'file path: {row[2]}\t[!] 扫描器报告文件未能定位，需人工复核\n'
+                    continue
+                try:
+                    md5 = file_md5(file_path)
+                except OSError:
+                    md5 = '读取失败'
+                try:
+                    relative = file_path.relative_to(local_path).as_posix()
+                except ValueError:
+                    relative = row[2].replace('\\', '/')
+                server_path = path.rstrip('/') + '/' + relative
+                output += f'file path: {server_path}\tmd5: {md5}\t[!] 疑似 webshell 文件\n'
+        finally:
+            # Extracted webroots can reach 2GB; keep them only while the scan
+            # needs them so repeated investigations cannot fill the disk.
+            shutil.rmtree(local_path, ignore_errors=True)
     return output or empty_result('未发现疑似 webshell')
 
 
@@ -2509,11 +2967,24 @@ def check_ssh():
 
     output = ''
 
-    result = exec_command(ssh_session.client, 'ls -al /usr/sbin/sshd 2>/dev/null')
-    if not result['status'] and not result['result']:
+    result = exec_command(ssh_session.client, 'ls -al /usr/sbin/sshd 2>&1')
+    kind = classify_remote_result(result)
+    if kind == 'not_found':
+        return '[NOT_FOUND] /usr/sbin/sshd 不存在，需人工确认 SSH 服务实际路径'
+    if kind == 'permission_denied':
+        return remote_result_issue(result, '/usr/sbin/sshd', '读取', include_missing=True) or command_failure(
+            result, '/usr/sbin/sshd 检查失败'
+        )
+    if kind != 'ok':
         return command_failure(result, '/usr/sbin/sshd 检查失败')
-    if result['status'] and ' -> ' in result['result']:
-        output += f'content: {result["result"]}\t[!] /usr/sbin/sshd 已被劫持\n'
+    if result['result']:
+        text = result['result'].strip()
+        if ' -> ' in text:
+            target = text.split(' -> ', 1)[1].strip()
+            # A symlink is unusual for sshd but also a legitimate packaging
+            # choice on some systems; require manual confirmation instead of
+            # declaring a hijack from ls output alone.
+            output += f'content: {text}\t[i] /usr/sbin/sshd 是软链接 -> {target}，需人工复核\n'
 
     return output or empty_result()
 
@@ -2537,7 +3008,7 @@ def check_ssh_wrapper():
         return command_failure(result, 'sshd strings 提取失败')
     if result.get('truncated'):
         warnings.append('[TRUNCATED] sshd strings 输出超过 max_bytes，结果可能不完整')
-    if result['status'] and result['result']:
+    if result['result']:
         for line in result['result'].splitlines():
             malicious = detect_malicious_text(line.strip(), warnings=warnings)
             if malicious:
@@ -2587,32 +3058,96 @@ def check_xinetd():
     return append_warnings(output or empty_result(), warnings)
 
 
+COMMON_SUID_SGID_PATHS = {
+    '/bin/at', '/bin/chage', '/bin/expiry', '/bin/gpasswd', '/bin/mount',
+    '/bin/newgrp', '/bin/passwd', '/bin/ping', '/bin/ping6', '/bin/su',
+    '/bin/umount', '/sbin/mount.cifs', '/sbin/mount.nfs', '/usr/bin/at',
+    '/usr/bin/chfn', '/usr/bin/chsh', '/usr/bin/crontab', '/usr/bin/expiry',
+    '/usr/bin/fusermount', '/usr/bin/fusermount3', '/usr/bin/gpasswd',
+    '/usr/bin/mount', '/usr/bin/newgrp', '/usr/bin/nsenter',
+    '/usr/bin/passwd', '/usr/bin/ping', '/usr/bin/ping6', '/usr/bin/pkexec',
+    '/usr/bin/rcp', '/usr/bin/rlogin', '/usr/bin/rsh', '/usr/bin/su',
+    '/usr/bin/sudo', '/usr/bin/umount', '/usr/bin/wall', '/usr/bin/write',
+    '/usr/lib/dbus-1.0/dbus-daemon-launch-helper',
+    '/usr/lib/openssh/ssh-keysign', '/usr/lib/policykit-1/polkit-agent-helper-1',
+    '/usr/lib/pt_chown', '/usr/lib/snapd/snap-confine',
+    '/usr/lib/utempter/utempter', '/usr/libexec/openssh/ssh-keysign',
+    '/usr/sbin/mount.cifs', '/usr/sbin/mount.nfs',
+}
+
+
 @mcp.tool()
 def check_setuid():
     """
-    查找 SUID 文件。
+    查找 SUID/SGID 文件。
     调用：排查本地提权后门或异常 SUID 程序时使用。
-    输出：返回发现的 SUID 文件路径。
+    输出：返回发现的 SUID/SGID 文件、属主和模式；常见系统程序标记为需校验，非典型路径标记为需人工复核；覆盖所有本地挂载点。
     """
 
     if not check_session():
         return SESSION_ERROR
 
-    output = ''
+    output = []
+    warnings = []
 
-    command = r"find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /mnt -o -path /media \) -prune -o -type f -perm -4000 -print 2>/dev/null"
-    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=500000)
-    if not result['status']:
-        return command_failure(result, 'SUID 文件扫描失败')
-    if not result['result']:
-        return empty_result()
+    command = (
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_suid_$$.err); '
+        'out=$(mktemp 2>/dev/null || echo /tmp/autoir_suid_$$.out); '
+        'dirs=$(df -P -l 2>/dev/null | awk \'NR>1 {print $6}\' | sort -u); '
+        '[ -n "$dirs" ] || dirs=/; '
+        'for d in $dirs; do '
+        'case "$d" in /proc*|/sys*|/dev*|/run*|/mnt*|/media*) continue;; esac; '
+        'find "$d" -xdev -type f \\( -perm -4000 -o -perm -2000 \\) '
+        '-exec stat -c \'%A %U:%G %n\' {} + >>"$out" 2>>"$err"; '
+        'done; '
+        'sort -u "$out" | head -n 2000; '
+        f"printf '\\n{FIND_STDERR_MARK}\\n'; "
+        'head -n 10 "$err"; rm -f "$out" "$err"'
+    )
+    result = exec_command(ssh_session.client, command, timeout=120, max_bytes=500000)
+    if not result['status'] and not result['result']:
+        return command_failure(result, 'SUID/SGID 文件扫描失败')
 
-    for line in result['result'].splitlines():
-        output += f'command {line.strip()}\t[!] SUID 后门\n'
-    if result.get('truncated'):
-        output += '[TRUNCATED] SUID 扫描输出超过 max_bytes，结果可能不完整\n'
+    data, errors = split_find_output(result['result'])
+    if errors:
+        kind = classify_remote_error_text(errors)
+        first = errors.splitlines()[0][:200]
+        if kind == 'permission_denied':
+            warnings.append(f'[PERMISSION] SUID/SGID 扫描权限不足，结果可能不完整，需人工复核: {first}')
+        else:
+            warnings.append(f'[WARN] SUID/SGID 扫描部分失败: {first}')
 
-    return output or empty_result()
+    for line in data.splitlines():
+        parts = line.split(' ', 2)
+        if len(parts) < 3:
+            continue
+        mode, owner, file_path = parts
+        if not file_path.startswith('/'):
+            continue
+        flags = []
+        if len(mode) >= 4 and mode[3] in 'sS':
+            flags.append('SUID')
+        if len(mode) >= 7 and mode[6] in 'sS':
+            flags.append('SGID')
+        if not flags:
+            continue
+        label = '/'.join(flags)
+        if owner.split(':', 1)[0] != 'root':
+            output.append(
+                f'{file_path}\tmode: {mode}\towner: {owner}\t[!] {label} 属主非 root，需人工复核'
+            )
+        elif file_path in COMMON_SUID_SGID_PATHS:
+            output.append(
+                f'{file_path}\tmode: {mode}\towner: {owner}\t[i] 常见 {label} 程序，建议核对包完整性'
+            )
+        else:
+            output.append(
+                f'{file_path}\tmode: {mode}\towner: {owner}\t[!] 非典型 {label}，需人工复核'
+            )
+
+    if not output:
+        return append_warnings(empty_result('未发现 SUID/SGID 文件'), warnings)
+    return append_warnings('\n'.join(output), warnings)
 
 
 @mcp.tool()
@@ -2715,7 +3250,10 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
 
     result = exec_command(ssh_session.client, f'tail -n {int(max_lines)} {quote_remote_path(path)}', timeout=20)
     if not result['status']:
-        return command_failure(result, '日志读取失败')
+        issue = remote_result_issue(result, path, '读取', include_missing=True)
+        return issue or command_failure(result, '日志读取失败')
+    if result.get('truncated'):
+        output.append('[TRUNCATED] 日志输出超过采集上限，统计和特征匹配可能不完整')
     if not result['result']:
         return empty_result('日志为空或无可读内容')
 
@@ -2743,23 +3281,34 @@ def check_log(path='/var/log/apache2/access.log', max_lines=5000):
         else:
             request_others.append(request)
 
-    output.append('成功访问 IP 统计')
-    output.extend(f'\tip: {ip}\tcount: {count}' for ip, count in collections.Counter(request['ip'] for request in request_success).items())
+    def add_ip_counts(title, requests):
+        counts = collections.Counter(request['ip'] for request in requests).most_common()
+        output.append(title)
+        output.extend(f'\tip: {ip}\tcount: {count}' for ip, count in counts[:50])
+        if len(counts) > 50:
+            output.append(f'\t[TRUNCATED] 共 {len(counts)} 个来源 IP，仅展示前 50 个')
 
-    output.append('\n跳转访问 IP 统计')
-    output.extend(f'\tip: {ip}\tcount: {count}' for ip, count in collections.Counter(request['ip'] for request in request_jump).items())
-
-    output.append('\n失败访问 IP 统计')
-    output.extend(f'\tip: {ip}\tcount: {count}' for ip, count in collections.Counter(request['ip'] for request in request_others).items())
+    add_ip_counts('成功访问 IP 统计', request_success)
+    add_ip_counts('\n跳转访问 IP 统计', request_jump)
+    add_ip_counts('\n失败访问 IP 统计', request_others)
 
     output.append('\n访问 User-Agent 统计')
-    output.extend(f'\tUser-Agent: {user_agent}' for user_agent in sorted(user_agents))
+    top_agents = collections.Counter(user_agents).most_common(50)
+    output.extend(f'\tUser-Agent: {user_agent}\tcount: {count}' for user_agent, count in top_agents)
+    if len(user_agents) > 50:
+        output.append(f'\t[TRUNCATED] 共 {len(user_agents)} 个 User-Agent，仅展示前 50 个')
 
-    output.append('\n成功访问 请求统计')
-    output.extend(f'\tip: {request["ip"]}\turi: {request["path"]}\tuser agent: {request["user_agent"]}' for request in request_success)
+    def add_requests(title, requests):
+        output.append(title)
+        output.extend(
+            f'\tip: {request["ip"]}\turi: {request["path"]}\tuser agent: {request["user_agent"]}'
+            for request in requests[:100]
+        )
+        if len(requests) > 100:
+            output.append(f'\t[TRUNCATED] 共 {len(requests)} 条请求，仅展示前 100 条')
 
-    output.append('\n跳转访问 请求统计')
-    output.extend(f'\tip: {request["ip"]}\turi: {request["path"]}\tuser agent: {request["user_agent"]}' for request in request_jump)
+    add_requests('\n成功访问 请求统计', request_success)
+    add_requests('\n跳转访问 请求统计', request_jump)
 
     return '\n'.join(output)
 
@@ -2776,10 +3325,11 @@ def check_login_success():
         return SESSION_ERROR
 
     result = first_success(ssh_session.client, [
-        'last',
         # grep exits 1 when there are simply no matches; only exit >=2 is an error.
         "grep -h 'Accepted' /var/log/auth.log /var/log/secure; [ $? -le 1 ]",
-    ])
+        "journalctl -n 5000 --no-pager 2>/dev/null | grep -h 'Accepted '",
+        'last',
+    ], timeout=30)
 
     if not result['status']:
         return command_failure(result, '成功登录日志读取失败')
@@ -2802,9 +3352,10 @@ def check_login_fail():
         return SESSION_ERROR
 
     result = first_success(ssh_session.client, [
-        'lastb',
         "grep -h -E 'Failed password|authentication failure|Invalid user' /var/log/auth.log /var/log/secure; [ $? -le 1 ]",
-    ])
+        "journalctl -n 5000 --no-pager 2>/dev/null | grep -h -E 'Failed password|authentication failure|Invalid user'",
+        'lastb',
+    ], timeout=30)
 
     if not result['status']:
         return command_failure(result, '失败登录日志读取失败')
@@ -2815,14 +3366,7 @@ def check_login_fail():
     return output or empty_result('未发现失败登录 IP')
 
 
-@mcp.tool()
-def RookitUpload(install=False):
-    """
-    上传 rkhunter；默认不安装。
-    调用：需要 rootkit 深度检测时使用；只有明确 install=True 时才会在目标机执行安装脚本。
-    输出：返回上传状态、人工安装命令或显式安装结果。
-    """
-
+def _rootkit_upload_impl(install=False):
     if not check_session():
         return SESSION_ERROR
 
@@ -2849,6 +3393,21 @@ def RookitUpload(install=False):
             return '[success] rkhunter rootkit 检测工具上传安装成功，需要用户手动执行命令 rkhunter --check'
 
     return command_failure(result, 'rkhunter 安装失败')
+
+
+@mcp.tool()
+def RootkitUpload(install=False):
+    """
+    上传 rkhunter；默认不安装。
+    调用：需要 rootkit 深度检测时使用；只有明确 install=True 时才会在目标机执行安装脚本。
+    输出：返回上传状态、人工安装命令或显式安装结果。
+    """
+    return _rootkit_upload_impl(install)
+
+
+@mcp.tool(name='RookitUpload', description='兼容旧工具名，已弃用；请改用 RootkitUpload。')
+def RookitUploadAlias(install=False):
+    return _rootkit_upload_impl(install)
 
 
 @mcp.tool()
@@ -2888,8 +3447,10 @@ def check_alias():
         result = exec_command(ssh_session.client, f"grep -nE '^alias[[:space:]]+' {quote_remote_path(path)} 2>/dev/null")
         if result['status'] and result['result']:
             for line in result['result'].splitlines():
-                label = '可疑 alias 后门' if dangerous.search(line) else 'alias 定义需复核'
-                output.append(f'file: {path}\tcontent: {line}\t[!] {label}')
+                if dangerous.search(line):
+                    output.append(f'file: {path}\tcontent: {line}\t[!] 可疑 alias 后门')
+                else:
+                    output.append(f'file: {path}\tcontent: {line}\t[i] alias 定义需复核')
     return '\n'.join(output) or empty_result()
 
 
@@ -2931,17 +3492,21 @@ def check_fstab():
     if not check_session():
         return SESSION_ERROR
 
-    result = exec_command(ssh_session.client, 'cat /etc/fstab 2>/dev/null')
+    result = exec_command(ssh_session.client, 'cat /etc/fstab 2>&1')
     if not result['status']:
-        return command_failure(result, 'fstab 读取失败')
+        issue = remote_result_issue(result, '/etc/fstab', '读取', include_missing=True)
+        return issue or command_failure(result, 'fstab 读取失败')
     output = []
-    suspicious = re.compile(r'(curl|wget|/dev/tcp|sshfs|nfs|cifs|tmpfs|fuse|overlay|auto|x-systemd)', re.I)
+    high = re.compile(r'(curl|wget|/dev/tcp|sshfs|nfs|cifs)', re.I)
+    review = re.compile(r'(tmpfs|fuse|overlay|auto|x-systemd)', re.I)
     for line in result['result'].splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith('#'):
             continue
-        if suspicious.search(stripped):
-            output.append(f'file: /etc/fstab\tcontent: {stripped}\t[!] 异常挂载项需复核')
+        if high.search(stripped):
+            output.append(f'file: /etc/fstab\tcontent: {stripped}\t[!] 网络/命令执行类挂载项，需重点复核')
+        elif review.search(stripped):
+            output.append(f'file: /etc/fstab\tcontent: {stripped}\t[i] 特殊文件系统挂载项，需结合环境复核')
     return '\n'.join(output) or empty_result()
 
 
@@ -2976,8 +3541,15 @@ def check_service_execstart():
 
     command = r"grep -RInE 'Exec(Start|StartPre|StartPost)=.*(bash -i|/dev/tcp|curl|wget|nc |ncat|socat|python -c|perl -e|chmod \+s)' /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system 2>/dev/null"
     result = exec_command(ssh_session.client, command, timeout=30, max_bytes=120000)
-    if result['status'] and result['result']:
-        return '\n'.join(f'{line}\t[!] systemd 高危启动命令' for line in result['result'].splitlines())
+    if result['result']:
+        # grep exits 2 when one of the fixed systemd paths is missing, but it
+        # still prints valid matches from the paths that exist.
+        output = '\n'.join(
+            f'{line}\t[!] systemd 高危启动命令' for line in result['result'].splitlines()
+        )
+        if not result['status']:
+            output += '\n[WARN] 部分 systemd 目录不可读或不存在，结果可能不完整'
+        return output
     if result.get('exit_status') in (0, 1):
         return empty_result()
     return command_failure(result, 'systemd 服务检查失败')
@@ -2993,12 +3565,55 @@ def check_deleted_exe():
     if not check_session():
         return SESSION_ERROR
 
-    result = exec_command(ssh_session.client, "ls -al /proc/*/exe 2>/dev/null | grep 'deleted'", timeout=20)
-    if result['status'] and result['result']:
-        return '\n'.join(f'{line}\t[!] deleted exe 进程' for line in result['result'].splitlines())
-    if result.get('exit_status') in (0, 1):
+    marker = '@@AUTOIR_EXE_ERR@@'
+    command = (
+        'out=$(mktemp 2>/dev/null || echo /tmp/autoir_exe_$$.out); '
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_exe_$$.err); '
+        'ls -al /proc/*/exe >"$out" 2>"$err"; rc=$?; '
+        'grep "deleted" "$out" || true; '
+        f"printf '\\n{marker}%s\\n' \"$rc\"; "
+        'head -n 10 "$err"; rm -f "$out" "$err"'
+    )
+    result = exec_command(ssh_session.client, command, timeout=20)
+    if not result['status'] and not result['result']:
+        return command_failure(result, 'deleted exe 检查失败')
+
+    data, separator, tail = result['result'].partition(marker)
+    errors = ''
+    exit_status = None
+    if separator:
+        first, _, errors = tail.partition('\n')
+        try:
+            exit_status = int(first.strip())
+        except ValueError:
+            exit_status = None
+        errors = errors.strip()
+    else:
+        # Without our marker the output is likely exec_command's stderr
+        # fallback, not a process list; never present it as findings.
+        errors = result['result'].strip()
+
+    warnings = []
+    if errors:
+        kind = classify_remote_error_text(errors)
+        first = errors.splitlines()[0][:200]
+        if kind == 'permission_denied':
+            warnings.append(f'[PERMISSION] 部分 /proc/<pid>/exe 不可读，结果可能不完整: {first}')
+        elif kind == 'not_found':
+            warnings.append('[NOT_FOUND] /proc 不可用或当前环境不支持 /proc/<pid>/exe')
+        else:
+            warnings.append(f'[WARN] deleted exe 检查部分失败: {first}')
+
+    output = '\n'.join(
+        f'{line.strip()}\t[!] deleted exe 进程' for line in data.splitlines() if line.strip()
+    )
+    if output:
+        return append_warnings(output, warnings)
+    if warnings:
+        return '\n'.join(warnings)
+    if exit_status in (0, 1, None):
         return empty_result()
-    return command_failure(result, 'deleted exe 检查失败')
+    return command_failure({'stderr': errors, 'result': errors}, 'deleted exe 检查失败')
 
 
 @mcp.tool()
@@ -3011,9 +3626,10 @@ def check_dns_config():
     if not check_session():
         return SESSION_ERROR
 
-    result = exec_command(ssh_session.client, 'cat /etc/resolv.conf 2>/dev/null')
+    result = exec_command(ssh_session.client, 'cat /etc/resolv.conf 2>&1')
     if not result['status']:
-        return command_failure(result, 'DNS 配置读取失败')
+        issue = remote_result_issue(result, '/etc/resolv.conf', '读取', include_missing=True)
+        return issue or command_failure(result, 'DNS 配置读取失败')
     output = []
     for line in result['result'].splitlines():
         stripped = line.strip()
@@ -3025,8 +3641,12 @@ def check_dns_config():
             is_local = address.is_private or address.is_loopback or address.is_link_local
         except ValueError:
             is_local = False
-        risk = 'DNS 配置' if is_local else '公共/外部 DNS 需复核'
-        output.append(f'file: /etc/resolv.conf\tcontent: {stripped}\t[!] {risk}')
+            output.append(f'file: /etc/resolv.conf\tcontent: {stripped}\t[!] nameserver 不是合法 IP，需人工复核')
+            continue
+        if is_local:
+            output.append(f'file: /etc/resolv.conf\tcontent: {stripped}\t[i] 内网/本机 DNS，需结合网络环境复核')
+        else:
+            output.append(f'file: /etc/resolv.conf\tcontent: {stripped}\t[i] 公共/外部 DNS，需结合企业规范复核')
     return '\n'.join(output) or empty_result()
 
 
@@ -3044,17 +3664,32 @@ def check_auth_log(max_lines=5000):
         max_lines = max(1, min(int(max_lines), 50000))
     except (TypeError, ValueError):
         max_lines = 5000
-    command = f"tail -n {max_lines} /var/log/auth.log /var/log/secure"
-    result = exec_command(ssh_session.client, command, timeout=20, max_bytes=200000)
+    command = (
+        'if [ -r /var/log/auth.log ] || [ -r /var/log/secure ]; then '
+        f'tail -q -n {max_lines} /var/log/auth.log /var/log/secure; '
+        'elif command -v journalctl >/dev/null 2>&1; then '
+        f"journalctl -n {max_lines} --no-pager 2>/dev/null | grep -Ei 'sshd|Failed password|Accepted |Invalid user|authentication failure' || true; "
+        'else '
+        'printf "no auth log or journalctl available\\n" >&2; exit 1; '
+        'fi'
+    )
+    result = exec_command(ssh_session.client, command, timeout=30, max_bytes=200000)
     warnings = []
     if not result['status']:
         # tail exits non-zero when one of the two paths is missing even though
         # it still prints useful lines from the other one.
         if not result.get('stdout'):
+            detail = result.get('stderr') or result.get('error') or result.get('result') or ''
+            kind = classify_remote_error_text(detail)
+            if kind == 'permission_denied':
+                first = detail.strip().splitlines()[0][:200] if detail.strip() else '无错误详情'
+                return f'[PERMISSION] auth 日志读取权限不足: {first}'
+            if kind == 'not_found' or 'no auth log' in detail:
+                return '[NOT_FOUND] /var/log/auth.log、/var/log/secure 和 journalctl 均不可用，需人工确认日志配置'
             return command_failure(result, 'auth 日志读取失败')
         detail = (result.get('stderr') or '').strip().splitlines()
         warnings.append(f'[WARN] auth 日志部分读取失败: {detail[0][:200] if detail else "未知错误"}')
-    lines = (result.get('stdout') or '').splitlines()
+    lines = (result.get('stdout') or result.get('result') or '').splitlines()
     failed = [line for line in lines if re.search(r'Failed password|authentication failure|Invalid user', line, re.I)]
     accepted = [line for line in lines if re.search(r'Accepted (password|publickey)', line, re.I)]
     output = []
@@ -3173,12 +3808,13 @@ def profile_suspicious_file(path, max_preview_lines=40, max_strings=80):
     quoted = quote_remote_path(path)
     stat_result = exec_command(
         ssh_session.client,
-        f"stat -c '%F\t%A\t%a\t%U:%G\t%s\t%y\t%n' {quoted} 2>/dev/null",
+        f"stat -c '%F\t%A\t%a\t%U:%G\t%s\t%y\t%n' {quoted} 2>&1",
         timeout=10,
         max_bytes=8000,
     )
     if not stat_result['status']:
-        return {"status": False, "path": path, "result": command_failure(stat_result, '文件元数据读取失败')}
+        issue = remote_result_issue(stat_result, path, '读取', include_missing=True)
+        return {"status": False, "path": path, "result": issue or command_failure(stat_result, '文件元数据读取失败')}
 
     fields = stat_result.get('result', '').split('\t')
     file_type = fields[0] if len(fields) > 0 else ''
@@ -3251,9 +3887,10 @@ def download_file(remote_path, local_dir='downloads/evidence', max_bytes=100 * 1
         local_dir = 'downloads/evidence'
     remote_path = remote_path.strip()
     quoted_remote = quote_remote_path(remote_path)
-    stat_result = exec_command(ssh_session.client, f"stat -c '%s\t%n\t%s bytes\t%U:%G\t%A\t%y' {quoted_remote} 2>/dev/null", timeout=10, max_bytes=4000)
+    stat_result = exec_command(ssh_session.client, f"stat -c '%s\t%n\t%s bytes\t%U:%G\t%A\t%y' {quoted_remote} 2>&1", timeout=10, max_bytes=4000)
     if not stat_result.get('status'):
-        return {"status": False, "remote_path": remote_path, "result": command_failure(stat_result, '远程文件元数据读取失败')}
+        issue = remote_result_issue(stat_result, remote_path, '读取', include_missing=True)
+        return {"status": False, "remote_path": remote_path, "result": issue or command_failure(stat_result, '远程文件元数据读取失败')}
     try:
         remote_size = int(stat_result.get('result', '').split('\t', 1)[0])
     except (IndexError, ValueError):
@@ -3323,16 +3960,29 @@ def collect_evidence_bundle(include_logs=True, include_files=False):
     commands = {
         'system.txt': "hostname; uname -a; date; uptime; cat /etc/os-release 2>/dev/null",
         'users.txt': "cat /etc/passwd; printf '\n--- sudoers ---\n'; cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null",
-        'processes.txt': "ps auxww; printf '\n--- deleted exe ---\n'; ls -al /proc/*/exe 2>/dev/null | grep deleted || true",
+        'processes.txt': "ps auxww; printf '\\n--- deleted exe ---\\n'; ls -al /proc/*/exe 2>&1 | grep -E 'deleted|Permission denied' || true",
         'network.txt': "ip addr; ss -anutp 2>/dev/null || netstat -anutp 2>/dev/null; cat /etc/hosts; cat /etc/resolv.conf 2>/dev/null",
         'services.txt': "systemctl list-units --type=service --all --no-pager 2>/dev/null; systemctl list-unit-files --type=service --state=enabled --no-pager 2>/dev/null",
         'scheduled.txt': "crontab -l 2>/dev/null; ls -al /var/spool/cron /var/spool/cron/crontabs 2>/dev/null; atq 2>/dev/null",
         'startup.txt': "find /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system -maxdepth 2 -type f 2>/dev/null | head -500; cat /etc/rc.local /etc/profile 2>/dev/null",
     }
     if include_logs:
-        commands['logs.txt'] = "tail -n 1000 /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages 2>/dev/null"
+        # Iterate explicitly: multi-file tail adds headers and hides missing or
+        # unreadable logs behind redirection.
+        commands['logs.txt'] = (
+            "for f in /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages; do "
+            "if [ -r \"$f\" ]; then printf '## %s\\n' \"$f\"; tail -n 1000 \"$f\"; "
+            "elif [ -e \"$f\" ]; then printf '## %s [PERMISSION]\\n' \"$f\"; fi; done; "
+            "if command -v journalctl >/dev/null 2>&1; then "
+            "printf '## journalctl (last 1000)\\n'; journalctl -n 1000 --no-pager 2>&1 | head -n 1000; fi"
+        )
     if include_files:
-        commands['tmp_files.txt'] = "find /tmp -type f -printf '%p\t%u:%g\t%m\t%s bytes\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | head -1000"
+        commands['tmp_files.txt'] = (
+            "for d in /tmp /var/tmp /dev/shm /run/shm; do "
+            "[ -d \"$d\" ] || continue; printf '## %s\\n' \"$d\"; "
+            "find \"$d\" -xdev -type f -exec stat -c '%y\\t%U:%G\\t%A\\t%s bytes\\t%n' {} + 2>&1 | head -n 500; "
+            "done"
+        )
     client = ssh_session.client
 
     def collect(item):
@@ -3404,13 +4054,34 @@ def check_recent_systemd_changes(days=7):
         days = max(1, min(int(days), 365))
     except (TypeError, ValueError):
         days = 7
-    command = f"find /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system -type f -mtime -{days} -printf '%TY-%Tm-%Td %TH:%TM\t%p\n' 2>/dev/null"
-    result = exec_command(ssh_session.client, command, timeout=30, max_bytes=200000)
-    if result['status'] and result['result']:
-        return result['result']
-    if result.get('exit_status') in (0, 1):
-        return empty_result(f'最近 {days} 天未发现 systemd 文件变更')
-    return command_failure(result, 'systemd 近期变更检查失败')
+    paths = ['/etc/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system']
+    command = portable_recent_find(
+        paths,
+        days,
+        '%TY-%Tm-%Td %TH:%TM\\t%p\\n',
+        '%y\\t%n',
+        2000,
+    )
+    result = exec_command(ssh_session.client, command, timeout=60, max_bytes=200000)
+    if not result['status'] and not result['result']:
+        return command_failure(result, 'systemd 近期变更检查失败')
+
+    data, errors = split_find_output(result['result'])
+    warnings = []
+    if errors:
+        if find_printf_fallback_error(errors):
+            warnings.append('[INFO] 目标 find 不支持 -printf，已回退到 stat 输出')
+        elif classify_remote_error_text(errors) == 'permission_denied':
+            first = errors.splitlines()[0][:200]
+            warnings.append(f'[PERMISSION] systemd 目录扫描权限不足，结果可能不完整: {first}')
+        elif not data:
+            return f'[NOT_FOUND] systemd 单元目录不可读或不存在: {errors.splitlines()[0][:200]}'
+        else:
+            warnings.append(f'[WARN] systemd 近期变更检查部分失败: {errors.splitlines()[0][:200]}')
+
+    if not data:
+        return append_warnings(empty_result(f'最近 {days} 天未发现 systemd 文件变更'), warnings)
+    return append_warnings(data, warnings)
 
 
 def container_runtime():
@@ -3422,10 +4093,12 @@ def container_runtime():
 
 
 def container_ids(runtime):
-    result = exec_command(ssh_session.client, f"{runtime} ps -aq --no-trunc 2>/dev/null", timeout=20)
-    if not result['status'] or not result['result']:
-        return []
-    return [line.strip() for line in result['result'].splitlines() if line.strip()]
+    result = exec_command(ssh_session.client, f"{runtime} ps -aq --no-trunc 2>&1", timeout=20)
+    if not result['status']:
+        detail = (result.get('result') or result.get('stderr') or '').strip()
+        return [], detail or '容器列表获取失败，可能无权限或 daemon 不可访问'
+    ids = [line.strip() for line in (result.get('result') or '').splitlines() if line.strip()]
+    return ids, ''
 
 
 @mcp.tool()
@@ -3458,19 +4131,21 @@ def check_container_mounts():
     runtime = container_runtime()
     if not runtime:
         return empty_result('未发现 docker/podman 命令')
-    ids = container_ids(runtime)
+    ids, error = container_ids(runtime)
+    if error:
+        return f'[FAILED] {runtime} 容器枚举失败: {truncate_text(error, 300)}'
     if not ids:
         return empty_result('未发现容器')
     quoted_ids = ' '.join(shlex.quote(cid) for cid in ids[:50])
     result = exec_command(
         ssh_session.client,
-        f"{runtime} inspect --format '{{{{.Name}}}} {{{{json .Mounts}}}}' {quoted_ids} 2>/dev/null",
+        f"{runtime} inspect --format '{{{{.Name}}}} {{{{json .Mounts}}}}' {quoted_ids} 2>&1",
         timeout=30,
         max_bytes=500000,
     )
     if result['status'] and result['result']:
         return result['result']
-    return empty_result('未发现容器挂载信息')
+    return command_failure(result, '容器挂载信息获取失败')
 
 
 @mcp.tool()
@@ -3485,15 +4160,17 @@ def check_container_processes():
     runtime = container_runtime()
     if not runtime:
         return empty_result('未发现 docker/podman 命令')
-    ids = container_ids(runtime)
+    ids, error = container_ids(runtime)
+    if error:
+        return f'[FAILED] {runtime} 容器枚举失败: {truncate_text(error, 300)}'
     if not ids:
         return empty_result('未发现容器')
     quoted_ids = ' '.join(shlex.quote(cid) for cid in ids[:50])
-    command = f'for cid in {quoted_ids}; do echo "## $cid"; {runtime} top "$cid" 2>/dev/null; done'
+    command = f'for cid in {quoted_ids}; do echo "## $cid"; {runtime} top "$cid" 2>&1; done'
     result = exec_command(ssh_session.client, command, timeout=60, max_bytes=500000)
     if result['status'] and result['result']:
         return result['result']
-    return empty_result('未发现容器进程信息')
+    return command_failure(result, '容器进程信息获取失败')
 
 
 @mcp.tool()
@@ -3505,15 +4182,55 @@ def check_user_crontabs():
     """
     if not check_session():
         return SESSION_ERROR
-    command = """awk -F: '$7 !~ /(nologin|false)$/ {print $1}' /etc/passwd 2>/dev/null | head -n 200 | while IFS= read -r user; do crontab=$(crontab -l -u "$user" 2>/dev/null); if [ -n "$crontab" ]; then printf '## user: %s\n%s\n\n' "$user" "$crontab"; fi; done"""
+    marker = '@@AUTOIR_CRON_ERR@@'
+    command = (
+        'err=$(mktemp 2>/dev/null || echo /tmp/autoir_cron_$$.err); '
+        "awk -F: '$7 !~ /(nologin|false)$/ {print $1}' /etc/passwd | head -n 200 | "
+        'while IFS= read -r user; do '
+        'crontab=$(crontab -l -u "$user" 2>>"$err"); '
+        "if [ -n \"$crontab\" ]; then printf '## user: %s\\n%s\\n\\n' \"$user\" \"$crontab\"; fi; "
+        'done; '
+        f"printf '\\n{marker}\\n'; "
+        "grep -v 'no crontab' \"$err\" | head -n 10; rm -f \"$err\""
+    )
     result = exec_command(ssh_session.client, command, timeout=60, max_bytes=300000)
+    if not result['status'] and not result['result']:
+        return command_failure(result, '用户级 crontab 读取失败')
+    data, _, errors = result['result'].partition(marker)
+    data, errors = data.strip(), errors.strip()
+    warnings = []
+    if errors:
+        kind = classify_remote_error_text(errors)
+        first = errors.splitlines()[0][:200]
+        if kind == 'permission_denied':
+            warnings.append(f'[PERMISSION] 用户级 crontab 读取权限不足，结果可能不完整: {first}')
+        else:
+            warnings.append(f'[WARN] 用户级 crontab 部分读取失败: {first}')
+    spool = exec_command(
+        ssh_session.client,
+        "find /var/spool/cron /var/spool/cron/crontabs -maxdepth 2 -type f "
+        "-exec stat -c '%n\\t%U:%G\\t%A\\t%s bytes' {} + 2>&1",
+        timeout=20,
+    )
+    spool_lines = []
+    spool_errors = []
+    for line in (spool.get('result') or '').splitlines():
+        if '\t' in line:
+            spool_lines.append(line)
+        elif line.strip():
+            spool_errors.append(line.strip())
+    if spool_errors:
+        combined_spool_errors = '\n'.join(spool_errors)
+        if classify_remote_error_text(combined_spool_errors) == 'permission_denied':
+            warnings.append('[PERMISSION] cron spool 目录读取权限不足，结果可能不完整')
+        else:
+            warnings.append(f'[WARN] cron spool 部分读取失败: {spool_errors[0][:200]}')
     output = []
-    if result['status'] and result['result']:
-        output.append(result['result'])
-    spool = exec_command(ssh_session.client, 'find /var/spool/cron /var/spool/cron/crontabs -maxdepth 2 -type f -printf "%p\t%u:%g\t%m\t%s bytes\n" 2>/dev/null', timeout=20)
-    if spool['status'] and spool['result']:
-        output.append('## cron spool files\n' + spool['result'])
-    return '\n\n'.join(output) or empty_result('未发现用户级 crontab')
+    if data:
+        output.append(data)
+    if spool_lines:
+        output.append('## cron spool files\n' + '\n'.join(spool_lines))
+    return append_warnings('\n\n'.join(output) or empty_result('未发现用户级 crontab'), warnings)
 
 
 @mcp.tool()
@@ -3531,12 +4248,24 @@ def check_at_jobs():
             return empty_result('未发现 at 任务或 at 不可用')
         return command_failure(result, 'atq 查询失败')
     output = ['## atq', result['result']]
+    job_ids = []
     for line in result['result'].splitlines()[:50]:
-        job_id = line.split()[0] if line.split() else ''
-        if job_id.isdigit():
-            job = exec_command(ssh_session.client, f'at -c {shlex.quote(job_id)} 2>/dev/null', timeout=10, max_bytes=50000)
-            if job['status'] and job['result']:
-                output.append(f'## at job {job_id}\n{job["result"]}')
+        fields = line.split()
+        if fields and fields[0].isdigit():
+            job_ids.append(fields[0])
+
+    if job_ids:
+        # Fetch all job bodies in one round trip; per-job exec_command made a
+        # large at queue take tens of seconds and risked transport timeouts.
+        script = '\n'.join(
+            f'printf "\\n## at job %s\\n" {shlex.quote(job_id)}; at -c {shlex.quote(job_id)} 2>&1'
+            for job_id in job_ids
+        )
+        jobs = exec_command(ssh_session.client, script, timeout=30, max_bytes=200000)
+        if jobs['status'] or jobs['result']:
+            output.append(jobs['result'])
+        else:
+            output.append(command_failure(jobs, 'at 任务内容读取失败'))
     return '\n\n'.join(output)
 
 

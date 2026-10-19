@@ -20,7 +20,8 @@ TOOL_CATEGORIES = {
         "check_dns_config",
     ],
     "文件/WebShell": [
-        "check_bin", "check_tmp", "check_recent_files", "discover_webroots", "check_webshell",
+        "check_bin", "check_tmp", "check_recent_files", "check_package_integrity",
+        "discover_webroots", "check_webshell",
     ],
     "后门/持久化": [
         "check_hijack", "check_ld_so_preload", "check_env_preload", "check_alias",
@@ -35,7 +36,7 @@ TOOL_CATEGORIES = {
     "日志": [
         "check_log", "check_web_logs_auto", "check_login_success", "check_login_fail",
     ],
-    "Rootkit": ["RookitUpload"],
+    "Rootkit": ["RootkitUpload"],
 }
 
 

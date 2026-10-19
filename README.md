@@ -39,7 +39,7 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 
 ### 基础与报告
 
-- `get_ssh_client`：建立 SSH 会话；支持 `verify_host_key=True` 与自定义 `known_hosts` 启用主机密钥校验。
+- `get_ssh_client`：建立 SSH 会话；支持密码、`key_file`/`passphrase` 私钥以及本机默认密钥/SSH agent 认证；支持 `verify_host_key=True` 与自定义 `known_hosts` 启用主机密钥校验。默认不校验主机密钥并在结果中给出中间人风险警告，实战环境应显式开启校验。
 - `check_ssh_session`：检查 SSH 会话是否可用。
 - `close_ssh_client`：关闭当前 SSH 会话。
 - `reset_session`：重置连接和会话状态。
@@ -61,10 +61,11 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `upload_file`：上传本地 `extensions/` 或 `downloads/` 内文件到目标主机。
 - `collect_evidence_bundle`：采集系统、用户、进程、网络、服务、计划任务和日志摘要。
 - `check_bin`：检查 `/usr/bin` 近期修改、权限和属主异常。
-- `check_tmp`：列举 `/tmp` 下文件。
+- `check_tmp`：扫描 `/tmp`、`/var/tmp`、`/dev/shm`、`/run/shm` 中的文件，并标注可执行文件和隐藏文件。
 - `check_recent_files`：检查指定目录近期变更文件。
+- `check_package_integrity`：使用 `rpm -Va` 或 `dpkg --verify` 校验已安装软件包文件完整性，用于发现被替换的系统命令、库和缺失文件；需要 root，`rpm` 全量校验可能较慢。
 - `discover_webroots`：自动发现常见 Web 根目录和配置中的站点目录。
-- `check_webshell`：扫描 webroot 中的疑似 WebShell。
+- `check_webshell`：扫描 webroot 中的疑似 WebShell。当前内置 HeMa 扫描器为 Windows `hm.exe`；若 `extensions/HeMa/hm` 存在也会自动使用。扫描完成后会删除本地解压目录，避免反复扫描占满磁盘；崩溃残留目录可通过 `AUTOIR_WEBSHELL_RETENTION_DAYS` 配置自动清理（默认 `0`，保守保留证据）。
 
 ### 用户与权限
 
@@ -127,7 +128,7 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 - `check_web_logs_auto`
 - `check_login_success`
 - `check_login_fail`
-- `RookitUpload`
+- `RootkitUpload`（旧名 `RookitUpload` 仍保留为兼容别名）
 
 ## SafeLine 配置
 
@@ -146,12 +147,17 @@ AutoIR_MCP 只暴露纯 MCP 工具和工具结果，不提供任何预设排查�
 ## 容错与安全
 
 - SSH 命令统一返回状态、stdout/stderr、退出码、超时和截断标记；并发执行有上限，避免压垮目标 sshd。
-- 常见检测提供 fallback，例如 `ss → netstat`、`ip → hostname -I`、`last/lastb → auth.log/secure`。
+- 常见检测提供 fallback，例如 `ss → netstat`、`ip → hostname -I`、`last/lastb → auth.log/secure`、`find -printf → stat`；认证日志支持 `journalctl` 回退。`find` 不可用、权限不足和路径不存在会明确标注，不再表现为“无异常”。
+- 临时目录排查覆盖 `/tmp`、`/var/tmp`、`/dev/shm`、`/run/shm`，避免只查磁盘目录而漏掉内存盘驻留样本。
+- `check_package_integrity` 使用 `rpm -Va` 或 `dpkg --verify` 校验软件包文件完整性；系统可执行文件/库不一致、软件包文件缺失会重点标注，无包管理器或校验失败时明确标注需人工复核。
+- `check_history` 除检查历史文件外，还会扫描下载执行、反弹 shell、编码解码、持久化、历史清理等特征；账户/服务类低信号命中单独标注，避免与高危特征混淆。
+- SSH 排查同时覆盖 `authorized_keys`、`authorized_keys2`、`sshrc`、`~/.ssh/rc` 和 `~/.ssh/config` 中的命令触发配置。
+- SUID/SGID 检查覆盖 `df` 列出的所有本地挂载点，同时检查 SUID 与 SGID；常见系统程序标记为“需校验包完整性”，非典型路径和属主非 root 标记为“需人工复核”，避免把 `passwd`、`sudo` 等全部误报为后门。
 - SafeLine 不可用时自动降级到本地规则，工具输出和报告必须明确标注“未经 WAF 检测”。
 - 多文件检查采用批量读取，减少 SSH 往返；每个文件保留独立退出码，权限不足不会被误报为“未发现异常”。
 - 大日志默认只分析最近 `max_lines` 行。
 - WebShell 扫描限制文件数量、单文件大小和下载大小，阻断 tar 路径穿越、链接和设备文件，并在扫描器失败或结果无法解析时报告检测失败。
-- 远程打包、扫描和下载使用独立运行目录，失败时会清理临时压缩包；并发扫描通过锁串行化。
+- 远程打包、扫描和下载使用独立运行目录，失败时会清理临时压缩包；扫描结束（包括异常退出）会删除本地解压目录；并发扫描通过锁串行化。
 - SFTP 下载带超时和硬性大小上限，失败时删除不完整文件。
 - 可疑文件画像只读取限定头部和限定 strings 片段，不整文件输出。
 - 兼容分析工具会把工具输出归一为 `status/result/data/error/meta` 结构；兼容报告工具返回可读报告文本，直接检测工具仍优先保持简洁可读。
